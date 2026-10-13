@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+output/
+tmp/
+*.log
+# per-machine CAD choice
+cad_runtime.json
+# customer drawings and generated files never go into the repository
+*.dwg
+*.dxf
+*.pdf
+*.zip
+*.sqlite

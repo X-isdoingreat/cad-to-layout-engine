@@ -1,0 +1,309 @@
+{
+  "schema_version": "ctle-zero-manual-lexicon-1.0",
+  "lexicon_id": "lexicon_v1.5",
+  "frozen_at": "2026-09-30",
+  "provenance": "Generic Chinese/English warehouse-logistics and building-drawing vocabulary: six common warehouse equipment types and common industry terms. No block, layer or text name taken from any supplied drawing. Changes require a new lexicon version and a tuning-ledger entry. v1.1 adds the international layer-standard words 'grid' (AIA/NCS S-GRID, A-GRID) and 'cols' (A-COLS, S-COLS). v1.2 adds the generic structural-drawing words '梁' (beam) and '钢平台' (steel platform) to view_role_terms.structural. v1.3 adds generic industry product words: conveyor generic names ('辊道机', '辊筒机', '皮带机', '滚筒线', '辊道线', '输送带'), and other_known_equipment classes VERTICAL_LIFT_MODULE, PICK_STATION, PALLETIZER, PALLET_DISPENSER, WRAPPER plus the spelling variants '移栽机'/'顶升移栽' and 'rgv'; other_known_equipment is now used by the text rule (reported as other equipment with its name). v1.4 adds zone_suffixes: generic endings of area names (a text ending in one names an area, not one machine). v1.5 adds unit-note phrasings '以米计', '以米为单位', '单位：米', '单位:米', '以毫米计', '以毫米为单位' and building_outline_layers (建筑物, 构筑物, 房屋, building, bldg) and elevation_legend_terms (indoor: 室内; ground: 室外, 场地, 地面, 道路, 设计地坪). Also v1.5: non_building_linework_layers (roads, greenery, centre lines, dimensions, frames, coordinate leaders, titles) and non_building_name_endings (路, 街, 河, 绿化, 广场).",
+  "equipment_types": {
+    "RACK": {
+      "label_zh": "货架",
+      "terms": [
+        "货架",
+        "立体库货架",
+        "横梁式货架",
+        "穿梭车货架",
+        "阁楼货架",
+        "重型货架",
+        "rack",
+        "racking",
+        "shelving"
+      ]
+    },
+    "PALLET_CONV_CHAIN": {
+      "label_zh": "托盘输送机（链条）",
+      "terms": [
+        "链条输送机",
+        "链式输送机",
+        "链条机",
+        "chain conveyor"
+      ]
+    },
+    "PALLET_CONV_ROLLER": {
+      "label_zh": "托盘输送机（滚筒）",
+      "terms": [
+        "滚筒输送机",
+        "辊筒输送机",
+        "辊道输送机",
+        "滚筒机",
+        "roller conveyor"
+      ]
+    },
+    "BOX_LIFT": {
+      "label_zh": "箱式提升机",
+      "terms": [
+        "箱式提升机",
+        "料箱提升机",
+        "提升机",
+        "垂直提升机",
+        "vertical lift",
+        "lifter"
+      ]
+    },
+    "BOX_CONVEYOR": {
+      "label_zh": "箱式输送机",
+      "terms": [
+        "箱式输送机",
+        "料箱输送机",
+        "周转箱输送机",
+        "皮带输送机",
+        "belt conveyor",
+        "tote conveyor"
+      ]
+    },
+    "ROBOT_ARM": {
+      "label_zh": "机械臂",
+      "terms": [
+        "机械臂",
+        "机器人",
+        "码垛机器人",
+        "拆垛机器人",
+        "robot"
+      ]
+    },
+    "STACKER": {
+      "label_zh": "堆垛机",
+      "terms": [
+        "堆垛机",
+        "巷道堆垛机",
+        "stacker crane",
+        "stacker"
+      ]
+    }
+  },
+  "subtype_qualifiers": {
+    "pallet": [
+      "托盘",
+      "pallet"
+    ],
+    "box": [
+      "料箱",
+      "周转箱",
+      "箱式",
+      "tote",
+      "bin"
+    ],
+    "chain": [
+      "链条",
+      "链式",
+      "chain"
+    ],
+    "roller": [
+      "滚筒",
+      "辊筒",
+      "辊道",
+      "roller"
+    ]
+  },
+  "generic_conveyor_terms": [
+    "输送机",
+    "输送线",
+    "conveyor",
+    "辊道机",
+    "辊筒机",
+    "皮带机",
+    "滚筒线",
+    "辊道线",
+    "输送带"
+  ],
+  "other_known_equipment": {
+    "LIFT_TRANSFER": [
+      "顶升移载",
+      "移载机",
+      "顶升机",
+      "顶升移栽",
+      "移栽机"
+    ],
+    "SHUTTLE": [
+      "穿梭车",
+      "四向车",
+      "shuttle",
+      "rgv"
+    ],
+    "AGV": [
+      "agv",
+      "叉车",
+      "forklift"
+    ],
+    "ELEVATOR": [
+      "货梯",
+      "电梯"
+    ],
+    "VERTICAL_LIFT_MODULE": [
+      "垂直升降柜",
+      "垂直升降货柜",
+      "升降货柜",
+      "回转柜",
+      "vlm"
+    ],
+    "PICK_STATION": [
+      "拣选工作台",
+      "拣选台",
+      "拣选站",
+      "拣货台"
+    ],
+    "PALLETIZER": [
+      "码垛机",
+      "拆垛机"
+    ],
+    "PALLET_DISPENSER": [
+      "码盘机",
+      "拆盘机"
+    ],
+    "WRAPPER": [
+      "缠绕机",
+      "裹膜机"
+    ]
+  },
+  "ignored_types": {
+    "ELECTRICAL_CABINET": [
+      "电控柜",
+      "控制柜",
+      "配电柜",
+      "电气柜"
+    ],
+    "LED": [
+      "led"
+    ]
+  },
+  "structure_roles": {
+    "BUILDING_WALL": [
+      "墙",
+      "wall"
+    ],
+    "COLUMN": [
+      "柱",
+      "column",
+      "colu",
+      "cols"
+    ],
+    "AXIS_LINE": [
+      "轴线",
+      "轴网",
+      "axis",
+      "grid"
+    ],
+    "ELEVATION_MARK": [
+      "标高",
+      "净高",
+      "檐口",
+      "屋面",
+      "elevation"
+    ]
+  },
+  "view_role_terms": {
+    "plan": [
+      "平面",
+      "布置",
+      "plan",
+      "layout"
+    ],
+    "elevation": [
+      "立面",
+      "elevation"
+    ],
+    "section": [
+      "剖面",
+      "断面",
+      "section"
+    ],
+    "structural": [
+      "结构",
+      "基础",
+      "螺栓",
+      "梁",
+      "钢平台"
+    ],
+    "detail": [
+      "详图",
+      "大样",
+      "detail"
+    ],
+    "scheme": [
+      "方案"
+    ]
+  },
+  "unit_notes": {
+    "mm": [
+      "单位：mm",
+      "单位:mm",
+      "单位为mm",
+      "尺寸单位为毫米",
+      "单位：毫米",
+      "mm",
+      "以毫米计",
+      "以毫米为单位"
+    ],
+    "m": [
+      "单位：m",
+      "单位为米",
+      "标高单位为米",
+      "以米计",
+      "以米为单位",
+      "单位：米",
+      "单位:米"
+    ]
+  },
+  "zone_suffixes": [
+    "区",
+    "间",
+    "室",
+    "库",
+    "口",
+    "area",
+    "zone",
+    "room"
+  ],
+  "building_outline_layers": [
+    "建筑物",
+    "构筑物",
+    "房屋",
+    "building",
+    "bldg"
+  ],
+  "elevation_legend_terms": {
+    "indoor_floor": [
+      "室内"
+    ],
+    "ground": [
+      "室外",
+      "场地",
+      "地面",
+      "道路",
+      "设计地坪"
+    ],
+    "elevation_words": [
+      "标高",
+      "高程"
+    ]
+  },
+  "non_building_linework_layers": [
+    "道路",
+    "绿化",
+    "中心线",
+    "尺寸",
+    "标注",
+    "dim",
+    "图框",
+    "tk",
+    "frame",
+    "坐标",
+    "标题",
+    "title"
+  ],
+  "non_building_name_endings": [
+    "路",
+    "街",
+    "河",
+    "绿化",
+    "广场"
+  ]
+}
