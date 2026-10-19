@@ -183,3 +183,20 @@ ZONE_LABEL_MIN_COVERAGE = 0.9
 # Two views with the same title whose counted equipment (family and type) overlaps this much are one drawn set copied
 # (seen 2026-10-10: a whole set drawn twice side by side); their counts are listed but must not be added up.
 DUPLICATE_VIEW_MIN_OVERLAP = 0.9
+
+# Counting by repetition (repeat_count.py): equipment drawn as loose lines or parts is found where the same linework
+# repeats.  A place matches when this share of the example's length lies within the tolerance; a spacing counts only
+# when seen at least REPEAT_MIN_COPIES times; members shorter than REPEAT_MIN_MEMBER_MM are details, not structure.
+# Several anchors (in the middle of runs) are tried and the largest count at least two of them agree on is kept (an
+# anchor near a run's end finds less; a single large count can come from a cell too generic to mean anything).  Follow-up examples are questions for a person, at most REPEAT_MAX_FOLLOW_UPS per view.
+# Set 2026-10-14 from rack experiments on two drawings (both against frozen audits).
+REPEAT_MATCH_TOLERANCE_MM = 10.0
+REPEAT_MATCH_SHARE = 0.9
+REPEAT_MIN_COPIES = 8
+REPEAT_MIN_MEMBER_MM = 300.0
+REPEAT_MAX_SPACING_MM = 12000.0
+REPEAT_MIN_CELL_M2 = 0.3
+REPEAT_ANCHORS = 8
+REPEAT_MAX_FOLLOW_UPS = 3
+# A group whose places mostly (this share) fall on equipment already counted from blocks is not counted twice.
+REPEAT_ALREADY_COUNTED_SHARE = 0.5

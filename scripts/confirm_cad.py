@@ -26,7 +26,7 @@ from typing import Any
 import ezdxf
 
 from cad_to_layout.zero_manual import agent_reader, confirmation as C
-from scripts.write_agent_result_cad import ACCORE, LAYERS, _accore, _lisp_path, result_entities, save_dwg, write_result_dxf
+from scripts.write_agent_result_cad import LAYERS, result_entities, save_dwg, write_result_dxf
 
 
 OUTLINE_LAYER = "CTLE_厂房轮廓"  # the machine's outline of the designated building, red
@@ -41,9 +41,14 @@ def issue(args: argparse.Namespace) -> int:
     work, out = Path(args.work).resolve(), Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     read = json.loads((work / "agent_read.json").read_text(encoding="utf-8"))
-    archive = out / "ai_result_archive.json"
-    shutil.copyfile(work / "agent_read.json", archive)  # the AI result as it was before anyone confirmed anything
     answer = read.get("answer") or {}
+    if (work / "index.sqlite").is_file() and answer.get("buildings"):
+        # the program's checks are recomputed from the saved answer: they are deterministic, and checks added after
+        # the read (2026-10-16: area notes, total dimensions, notches) must reach a package rebuilt from an old read
+        read["checks"] = agent_reader.verify(work, answer)
+        read["checks_recomputed"] = True
+    archive = out / "ai_result_archive.json"
+    archive.write_text(json.dumps(read, ensure_ascii=False, indent=1), encoding="utf-8")  # the AI result as it was before anyone confirmed anything
     m = float(answer.get("unit_m") or 1.0)
     faces = json.loads((work / "faces.json").read_text(encoding="utf-8")) if (work / "faces.json").is_file() else {}
     found = agent_reader.findings(work, answer, read.get("checks", []))
@@ -89,7 +94,7 @@ STEP = {
     "view": "视图：先处理视图编号。同一楼层的几个方案只能选一个「要」；选了「不要」的视图，里面的其他编号都不用再处理。",
 }
 KIND_STEPS = {"view_count": "view", "zone_category": "category", "zone_no_area": "zone_area", "designated_outline_review": "outline",
-              "designated_missing": "outline", "outline_inner_line": "outline", "dimension": "outline", "remeasure": "outline"}
+              "designated_missing": "outline", "outline_inner_line": "outline", "dimension": "outline", "remeasure": "outline", "adjudicated": "outline"}
 
 
 def checklist(items: list[dict[str, Any]], drawing: str) -> list[str]:

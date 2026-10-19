@@ -156,6 +156,30 @@ class ConfirmationTest(unittest.TestCase):
         self.assertEqual(out["buildings"][0]["status"], "待确认")
         self.assertTrue(any("没有在「CTLE_人工轮廓」层重描" in p["problem"] for p in out["problems"]))
 
+    def test_drawing_number_and_notch_marks_are_questions_about_the_outline(self) -> None:
+        notch = [[40, 0], [60, 0], [60, 3], [40, 3], [40, 0]]
+        found = FOUND + [{"kind": "stated_area", "building": "A", "text": "图上写着 4200，量出 4000", "impact_m2": 200.0, "at": [50, 10], "geometry": None},
+                         {"kind": "notches", "building": "A", "text": "1 处浅凹口", "impact_m2": 60.0, "at": [50, 1], "geometry": {"polygons": [notch]}}]
+        items = C.build_items(found, read(), FACES)
+        ids = {it["kind"]: it["id"] for it in items}
+        self.assertIn("stated_area", ids)
+        self.assertIn("notches", ids)
+        self.assertTrue(any(e["kind"] == "outline" and e["record"]["item"] == ids["notches"] for e in C.mark_entities(items, 1.0)))  # the notches are drawn
+        issued = issue(items)
+        labels = issued["labels"]
+        # "yes" to both: the outline stands, confirmed by a person
+        yes = C.apply(read(), items, issued, returned(issued, {labels[ids["stated_area"]]: C.LAYER_YES, labels[ids["notches"]]: C.LAYER_YES,
+                                                             labels[ids["designated_outline_review"]]: C.LAYER_YES, labels[ids["outline_beyond_grid"]]: C.LAYER_YES}), 1.0)
+        self.assertEqual((yes["buildings"][0]["area_m2"], yes["buildings"][0]["outline_source"]), (4000.0, "人工确认"))
+        # "no" without a redrawn outline: nothing is changed by guessing, the item stays pending
+        no = C.apply(read(), items, issued, returned(issued, {labels[ids["notches"]]: C.LAYER_NO}), 1.0)
+        self.assertIn(ids["notches"], no["buildings"][0]["pending_items"])
+        self.assertTrue(any("没有在「CTLE_人工轮廓」层重描" in p["problem"] for p in no["problems"]))
+        # a redrawn outline answers every outline question, the notch one included
+        drawn = [[0, 0], [100, 0], [100, 30], [0, 30], [0, 0]]
+        redrawn = C.apply(read(), items, issued, returned(issued, {labels[ids["notches"]]: C.LAYER_NO}, outlines=[drawn]), 1.0)
+        self.assertEqual((redrawn["buildings"][0]["area_m2"], redrawn["buildings"][0]["status"]), (3000.0, "完成"))
+
     def test_default_categories_by_name_and_one_question_per_name(self) -> None:
         self.assertEqual([C.default_category(n) for n in ("飞机轮子存放库", "入库区", "办公区", "备件区", "领料间")],
                          ["storage", "operation", "office_living", None, "operation"])

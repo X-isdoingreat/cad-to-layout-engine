@@ -97,7 +97,97 @@ class AgentToolsTest(unittest.TestCase):
         check = T.dimension_check([[0, 0], [60000, 0], [60000, 24000], [0, 24000], [0, 0]], 0.001)
         self.assertEqual([(c["dimension_m"], c["differs_pct"]) for c in check], [(60.0, 0.0)])  # the bay dimension is not end to end
         short = T.dimension_check([[0, 0], [54000, 0], [54000, 24000], [0, 24000], [0, 0]], 0.001)
-        self.assertEqual([(c["dimension_m"], c["differs_pct"]) for c in short], [(60.0, -10.0)])  # an outline measured too short is caught
+        self.assertEqual([(c["dimension_m"], c["differs_pct"], c["flagged"]) for c in short], [(60.0, -10.0, True)])  # an outline measured too short is caught
+
+    def test_dimensions_are_found_by_length_over_the_whole_drawing_and_lists_are_paged(self) -> None:
+        # the 60 m total lies outside the window the agent chose: no window searches the whole drawing, by length
+        got = T.cmd_dimensions(argparse.Namespace(box=[], unit_m=None, limit=10, offset=0, match=None, length_m=60.0))
+        self.assertEqual(([d["length_m"] for d in got["dimensions"]], got["count"]), ([60.0], 1))
+        none = T.cmd_dimensions(argparse.Namespace(box=[100000, 100000, 200000, 200000], unit_m=None, limit=10, offset=0, match=None, length_m=60.0))
+        self.assertEqual(none["count"], 0)
+        bad = T.cmd_dimensions(argparse.Namespace(box=[1, 2, 3], unit_m=None, limit=10, offset=0, match=None, length_m=None))
+        self.assertIn("error", bad)
+        # a long list is never cut silently: the count, the page and how to get the rest
+        first = T.cmd_texts(argparse.Namespace(match="区", window=None, limit=2, offset=0))
+        self.assertEqual((first["count"], first["shown"], len(first["texts"])), (3, 2, 2))
+        self.assertIn("--offset 2", first["note"])
+        rest = T.cmd_texts(argparse.Namespace(match="区", window=None, limit=2, offset=2))
+        self.assertEqual((rest["shown"], "note" in rest), (1, False))
+        page = T.cmd_window(argparse.Namespace(box=[-2000, -2000, 62000, 26000], layers=["COL"], limit=5, offset=60))
+        self.assertEqual((page["items_count"], page["items_offset"], len(page["items"])), (64, 60, 4))  # 21 columns × 3 pieces + the partition
+
+    def test_a_total_dimension_drawn_beside_the_building_is_still_compared(self) -> None:
+        # the drawing's 60 m total is drawn 3 m below the wall; the outer wall 0.4 m beyond the axis is within the wall allowance
+        far = T.dimension_check([[0, 0], [60000, 0], [60000, 24000], [0, 24000], [0, 0]], 0.001)
+        self.assertEqual([(c["dimension_m"], c["flagged"]) for c in far], [(60.0, False)])
+        wall = T.dimension_check([[-200, 0], [60200, 0], [60200, 24000], [-200, 24000], [-200, 0]], 0.001)
+        self.assertEqual([(c["outline_extent_m"], c["flagged"]) for c in wall], [(60.4, False)])
+        elsewhere = T.dimension_check([[0, 100000], [60000, 100000], [60000, 124000], [0, 124000], [0, 100000]], 0.001)
+        self.assertEqual(elsewhere, [])  # 100 m away: another plan's dimension
+
+    def test_area_notes_near_the_outline_are_compared_and_parts_are_not(self) -> None:
+        doc = ezdxf.new()
+        doc.header["$INSUNITS"] = 4
+        msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (60000, 0), (60000, 24000), (0, 24000)], close=True, dxfattribs={"layer": "WALL"})
+        msp.add_text("本层面积1500.00平方米", dxfattribs={"insert": (40000, -6000), "height": 500})  # 9 m below the plan
+        msp.add_text("防火分区1", dxfattribs={"insert": (65000, 12000), "height": 500})
+        msp.add_text("900m²", dxfattribs={"insert": (65000, 11000), "height": 500})  # a compartment, labelled beside it
+        msp.add_text("45.5m²", dxfattribs={"insert": (10000, 12000), "height": 300})  # a room
+        msp.add_text("面积：1440M2", dxfattribs={"insert": (10000, 30000), "height": 500})  # 6 m above: compared, matches
+        doc.saveas("notes.dxf")
+        T.build_index("notes.dxf", Path("notes.sqlite"))
+        idx = T.Index(Path("notes.sqlite"))
+        try:
+            got = T.stated_area_check([[0, 0], [60000, 0], [60000, 24000], [0, 24000], [0, 0]], 1440.0, 0.001, idx)
+        finally:
+            idx.con.close()
+        self.assertEqual([(c["value_m2"], c["flagged"]) for c in got["compared"]], [(1500.0, True), (1440.0, False)])
+        self.assertEqual(got["not_compared"], {"part_of_floor": 1, "other_size": 1})
+
+    def test_trace_lists_outline_candidates_and_ranks_them_by_the_drawing_s_own_numbers(self) -> None:
+        # a 60 x 24 m hall: the wall layer has an 8 m gate in the south wall and a corridor wall 3 m inside it; the drafter's
+        # own area polyline lies on an AREA layer; the plan's area and its 60 m total are written on the drawing
+        T.close_all()
+        doc = ezdxf.new()
+        doc.header["$INSUNITS"] = 4
+        msp = doc.modelspace()
+        for a, b in [((0, 0), (26000, 0)), ((34000, 0), (60000, 0)), ((60000, 0), (60000, 24000)), ((60000, 24000), (0, 24000)), ((0, 24000), (0, 0))]:
+            msp.add_line(a, b, dxfattribs={"layer": "WALL"})
+        msp.add_line((0, 3000), (60000, 3000), dxfattribs={"layer": "WALL"})  # the corridor wall a trace dives to at the gate
+        msp.add_lwpolyline([(0, 0), (60000, 0), (60000, 24000), (0, 24000)], close=True, dxfattribs={"layer": "AREA"})
+        msp.add_lwpolyline([(100000, 0), (130000, 0), (130000, 20000), (100000, 20000)], close=True, dxfattribs={"layer": "AREA"})  # another building
+        for i in range(40):  # hatching: short pieces that must not drown the walls
+            msp.add_line((5000 + i * 1200, 10000), (5000 + i * 1200 + 300, 10300), dxfattribs={"layer": "HATCH"})
+        msp.add_text("本层面积1440.00平方米", dxfattribs={"insert": (30000, -6000), "height": 500})
+        msp.add_linear_dim(base=(0, -3000), p1=(0, 0), p2=(60000, 0), dxfattribs={"layer": "DIM"}).render()
+        doc.saveas("trace.dxf")
+        T.build_index("trace.dxf")
+        got = T.cmd_trace(argparse.Namespace(box=[-5000, -8000, 65000, 30000], seed=[30000, 12000], layers=None, unit_m=None,
+                                             min_line_m=T.TRACE_MIN_LINE_M, close_gaps_m=list(T.TRACE_CLOSE_GAPS_M)))
+        best = got["candidates"][0]
+        self.assertTrue(best["made_by"].startswith("closed polyline on layer AREA"))
+        self.assertEqual((best["area_m2"], best["matches_drawing"]), (1440.0, 2))  # the area note and the 60 m total
+        self.assertEqual(sorted(a["kind"] for a in best["against_drawing"] if a["match"]), ["dimension", "stated_area"])
+        self.assertTrue(any("close_gaps_m=6" in s for s in best["same_outline_from"]))  # the wall trace with the gate closed is the same outline
+        dived = [c for c in got["candidates"] if "close_gaps_m=2" in c["made_by"] and "WALL" in c["made_by"]]
+        self.assertEqual((len(dived), dived[0]["matches_drawing"] < 2), (1, True))  # the trace through the open gate matches fewer numbers
+        self.assertTrue(all(c["area_m2"] < 2000 for c in got["candidates"]))  # the other building does not contain the seed
+        faces = json.loads(T.FACES.read_text(encoding="utf-8"))
+        self.assertTrue(faces[best["id"]]["made_by"].startswith("trace:"))
+
+    def test_shallow_notches_are_marked_but_an_l_shape_is_not(self) -> None:
+        # a 100 x 40 m outline whose trace cut four notches 3 m deep and 12 m wide into the south wall (144 m², 3.6%)
+        notched = [[0, 0]]
+        for k in range(4):
+            x = 10000 + k * 22000
+            notched += [[x, 0], [x, 3000], [x + 12000, 3000], [x + 12000, 0]]
+        notched += [[100000, 0], [100000, 40000], [0, 40000], [0, 0]]
+        got = T.notch_check(notched, 0.001)
+        self.assertEqual((got["notches"], got["filled_m2"], got["flagged"]), (4, 144.0, True))
+        self.assertEqual(len(got["polygons"]), 4)
+        l_shape = [[0, 0], [100000, 0], [100000, 20000], [50000, 20000], [50000, 60000], [0, 60000], [0, 0]]
+        self.assertFalse(T.notch_check(l_shape, 0.001)["flagged"])  # a re-entrant corner 50 m wide is the building's shape
 
     def test_elevations_with_words_and_section(self) -> None:
         got = T.cmd_elevations(argparse.Namespace(box=[0, 30000, 40000, 50000], unit_m=None, near_m=5.0, limit=10))

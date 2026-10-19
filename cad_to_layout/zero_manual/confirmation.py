@@ -45,6 +45,9 @@ QUESTIONS = {
     "reads_missing": "另一次读图有这块，这次没有，算不算这栋楼？（要＝并入；不要＝不并入）",
     "reads_columns": "两次读图这栋楼的柱子数不一致：请删掉多余的柱子圈、在「CTLE_人工柱」层补上漏的；核对无误后选要。",
     "dimension": "图上总尺寸与轮廓长度不一致，轮廓对吗？（要＝轮廓对；不对请在「CTLE_人工轮廓」层重描）",
+    "stated_area": "图上写的面积与按轮廓量出的面积不一致，轮廓对吗？（要＝轮廓对，图上那个数口径不同；不对请在「CTLE_人工轮廓」层重描）",
+    "notches": "轮廓上这些浅凹口（紫色小框）是真的凹进去吗？（要＝真的凹进去，轮廓对；不是请在「CTLE_人工轮廓」层沿连续外墙重描）",
+    "adjudicated": "定夺复核改判了这栋楼的轮廓：红线已是改判后的轮廓，紫框是改判前的。新红线对吗？（要＝对；不对请在「CTLE_人工轮廓」层重描）",
     "remeasure": "程序重新量出的结果与读图报告不一致，这栋楼的轮廓对吗？（要＝对；不对请重描）",
     "columns": "这栋楼的柱子数可能不对：请删掉多余的柱子圈、在「CTLE_人工柱」层补上漏的，然后选要。",
     "building_not_reported": "这里有建筑名称，但没有读出这栋楼。需要的话在「CTLE_人工轮廓」层描出外轮廓；不需要选不要。",
@@ -59,6 +62,9 @@ QUESTIONS = {
     "zone_category": "这个区域看不出是存储还是作业：把编号移到「CTLE_类别_存储」「CTLE_类别_作业」或「CTLE_类别_其他」层。",
 }
 NOT_FOR_PEOPLE = {"bookkeeping", "columns", "reads_columns", "building_not_reported", "no_building"}  # trial scope: no columns, no other buildings  # findings about the agent's own record keeping; they change no number
+ADJUDICATED_KINDS = ("stated_area", "dimension", "notches", "remeasure")  # marks the adjudication step (adjudicator.py) gives a verdict on
+VERDICT_CN = {"outline_right": "认为轮廓对", "outline_wrong": "认为轮廓错", "cannot_decide": "没把握，交人"}
+NOTE_MAX_CHARS = 240  # the verdict's reason in a CAD label and on the page; the full text stays in items.json
 
 
 def _polygon(shape: Any) -> Any:
@@ -199,6 +205,50 @@ def designated_review_items(read: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def adjudication_note(finding: dict[str, Any], verdicts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The adjudicator's verdict on this finding (same text; else the same kind and building), in words for the reviewer."""
+
+    if finding["kind"] not in ADJUDICATED_KINDS:
+        return None
+    v = next((v for v in verdicts if v.get("text") == finding.get("text")), None) or next(
+        (v for v in verdicts if v.get("kind") == finding["kind"] and v.get("building") == finding.get("building")), None)
+    if v is None:
+        return None
+    why = str(v.get("why") or "").strip().rstrip("。")
+    applied = str(v.get("applied") or "")
+    said = VERDICT_CN.get(v["verdict"], v["verdict"]) + ("——" + why if why else "")
+    if v["verdict"] == "outline_wrong" and applied.startswith("没有改判"):
+        said += "；" + applied
+    cand = v.get("candidate")
+    if cand:
+        said += (f"；定夺画了一个候选轮廓（紫框，未采用）：{float(cand['area_m2']):,.0f} m²，长 {cand['length_m']} × 宽 {cand['width_m']} m，"
+                 + "，".join(cand.get("against_drawing") or []))
+    if len(said) > NOTE_MAX_CHARS:  # cut at a clause end, never mid-number; the full text stays in items.json
+        head = said[:NOTE_MAX_CHARS]
+        cut = max(head.rfind(p) for p in "；。，")
+        said = (head[:cut] if cut > NOTE_MAX_CHARS // 2 else head) + "…"
+    return {"discrepancy": v.get("discrepancy"), "verdict": v["verdict"], "why": why, "applied": applied, "said": said,
+            "candidate_outline": cand["outline"] if cand else None}
+
+
+def adjudicated_items(read: dict[str, Any]) -> list[dict[str, Any]]:
+    """One mark per building whose numbers the adjudication step replaced: the old outline is drawn, the person judges the new red line."""
+
+    out = []
+    m = float((read.get("answer") or {}).get("unit_m") or 1.0)
+    for o in (read.get("adjudication") or {}).get("overrides") or []:
+        before, after = o.get("before") or {}, o.get("after") or {}
+        hit = (o.get("matched") or [{}])[0]
+        p = _polygon(o["outline_before"])
+        x0, y0, x1, y1 = p.bounds
+        out.append({"kind": "adjudicated", "building": o["building"], "impact_m2": round(abs(float(after.get("area_m2") or 0) - float(before.get("area_m2") or 0)), 1),
+                    "at": [x0, y1 + 0.03 * (y1 - y0)], "geometry": {"polygons": [o["outline_before"]]},
+                    "text": f"AI 原读出 {float(before.get('area_m2') or 0):,.0f} m²（长 {before.get('length_m')} × 宽 {before.get('width_m')} m），"
+                            f"定夺复核改为 {float(after.get('area_m2') or 0):,.0f} m²（长 {after.get('length_m')} × 宽 {after.get('width_m')} m），"
+                            f"与图上写的「{hit.get('drawing')}」一致（相差 {float(hit.get('differs_pct') or 0):+.2f}%）"})
+    return out
+
+
 def height_items(read: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     for b in (read.get("answer") or {}).get("buildings") or []:
@@ -295,7 +345,18 @@ def build_items(found: list[dict[str, Any]], read: dict[str, Any], faces: dict[s
         raw += view_items(read, {i.get("view") for i in no_area})
     raw += [] if AREA_ONLY else height_items(read)  # trial (2026-10-10): height is not read
     raw += designated_review_items(read)
+    raw += adjudicated_items(read)
     raw = [f for f in raw if f["kind"] not in NOT_FOR_PEOPLE]
+    verdicts = (read.get("adjudication") or {}).get("verdicts") or []
+    drawn_candidates: list[Any] = []
+    for f in raw:
+        note = adjudication_note(f, verdicts)
+        if note:
+            f["adjudication"] = note
+            cand = note.get("candidate_outline")
+            if cand and cand not in drawn_candidates:  # drawn once with the first mark it answers, so the reviewer can compare it with the red line
+                drawn_candidates.append(cand)
+                f["geometry"] = {**(f.get("geometry") or {}), "polygons": list((f.get("geometry") or {}).get("polygons") or []) + [cand]}
     seen_texts, unique = set(), []
     for f in raw:  # the same finding twice (e.g. a dimension drawn twice) is one mark
         key = (f["kind"], f.get("building"), f.get("text")) if f.get("text") else None
@@ -308,8 +369,12 @@ def build_items(found: list[dict[str, Any]], read: dict[str, Any], faces: dict[s
     for n, f in enumerate(raw, 1):
         items.append({"id": f"C{n:02d}", "kind": f["kind"], "building": f.get("building"), "zone": f.get("zone"),
                       "view": f.get("view"),
-                      "question": QUESTIONS.get(f["kind"], f.get("text", "")) + (f"（{f['text']}）" if f["kind"] in {"view_count", "height"} else ""), "impact_m2": f.get("impact_m2", 0.0), "at": f["at"],
-                      "geometry": f.get("geometry"), "program_text": f.get("text")})
+                      "question": QUESTIONS.get(f["kind"], f.get("text", "")) + (f"（{f['text']}）" if f["kind"] in {"view_count", "height"} else "")
+                      + (f"　程序核对：{f['text'].split('：', 1)[-1].split('（影响')[0]}" if f["kind"] in {"dimension", "stated_area", "notches"} and f.get("text") else "")
+                      + (f"　程序核对：{f['text']}" if f["kind"] == "adjudicated" else "")
+                      + (f"　定夺复核：{f['adjudication']['said']}" if f.get("adjudication") else ""),
+                      "impact_m2": f.get("impact_m2", 0.0), "at": f["at"],
+                      "geometry": f.get("geometry"), "program_text": f.get("text"), "adjudication": f.get("adjudication")})
     return items
 
 
@@ -457,6 +522,7 @@ def apply(read: dict[str, Any], items: list[dict[str, Any]], issued: dict[str, A
     names = [c.get("name") for c in read.get("checks", []) if c.get("outline")]
     designated = {b.get("name") for b in (read.get("answer") or {}).get("buildings", []) if b.get("designated")}
     polys = {n: _polygon(_outline_of(read, n)) for n in names}
+    adjudicated = {o["building"]: o for o in (read.get("adjudication") or {}).get("overrides") or []}
     human = [o for o in returned.get("closed_outlines", []) if o["layer"] == LAYER_HUMAN_OUTLINE]
     human_for: dict[str, list[Any]] = {}
     new_buildings = []
@@ -475,10 +541,10 @@ def apply(read: dict[str, Any], items: list[dict[str, Any]], issued: dict[str, A
         mine = [it for it in items if it.get("building") == n]
         pending = [it["id"] for it in mine if decisions[it["id"]] in {"pending", "deleted"}]
         shape = polys[n]
-        source = "AI 读出"
+        source = "AI 定夺改判" if n in adjudicated else "AI 读出"
         if n in human_for:
             shape = unary_union(human_for[n])
-            outline_items = [it for it in mine if it["kind"].startswith(("outline", "reads", "dimension", "remeasure", "designated_outline"))]
+            outline_items = [it for it in mine if it["kind"].startswith(("outline", "reads", "dimension", "remeasure", "designated_outline", "stated_area", "notches", "adjudicated"))]
             source = "人工确认" if outline_items else "人工修改（未标记处）"
             pending = [p for p in pending if p not in {it["id"] for it in outline_items}]  # a drawn outline answers every outline question
         else:
@@ -499,8 +565,11 @@ def apply(read: dict[str, Any], items: list[dict[str, Any]], issued: dict[str, A
                 elif it["kind"] == "designated_outline_review" and d == "no":
                     problems.append({"item": it["id"], "problem": "选了不对，但没有在「CTLE_人工轮廓」层重描：保持待确认"})
                     pending.append(it["id"])
-                elif it["kind"] in {"outline_inner_line", "dimension", "remeasure", "designated_outline_review"} and d in {"yes", "no"}:
-                    source = "人工确认" if source == "AI 读出" else source
+                elif it["kind"] in {"stated_area", "notches", "adjudicated"} and d == "no":
+                    problems.append({"item": it["id"], "problem": "选了不对，但没有在「CTLE_人工轮廓」层重描：保持待确认"})
+                    pending.append(it["id"])
+                elif it["kind"] in {"outline_inner_line", "dimension", "remeasure", "designated_outline_review", "stated_area", "notches", "adjudicated"} and d in {"yes", "no"}:
+                    source = "人工确认" if source in {"AI 读出", "AI 定夺改判"} else source
         shape = max(_parts(shape), key=lambda g: g.area) if _parts(shape) else shape
         area = shape.area * m * m
         rect = shape.minimum_rotated_rectangle
@@ -524,7 +593,8 @@ def apply(read: dict[str, Any], items: list[dict[str, Any]], issued: dict[str, A
         buildings.append({"name": n, "designated": n in designated, "area_m2": round(area, 2), "length_m": round(sides[1] * m, 2),
                           "width_m": round(sides[0] * m, 2), "columns": len(kept) + len(added), "outline_source": source,
                           "columns_source": column_source, "pending_items": sorted(set(pending)),
-                          "status": "待确认" if pending else "完成", "outline": [[round(x, 3), round(y, 3)] for x, y in shape.exterior.coords]})
+                          "status": "待确认" if pending else "完成", "outline": [[round(x, 3), round(y, 3)] for x, y in shape.exterior.coords],
+                          **({"adjudicated": {k: adjudicated[n].get(k) for k in ("before", "after", "matched", "discrepancy")}} if n in adjudicated else {})})
     for k, hp in enumerate(new_buildings, 1):
         buildings.append({"name": f"人工补描建筑{k}", "designated": False, "area_m2": round(hp.area * m * m, 2), "outline_source": "人工修改（未标记处）",
                           "columns_source": None, "pending_items": [], "status": "完成", "outline": [[round(x, 3), round(y, 3)] for x, y in hp.exterior.coords]})
@@ -535,7 +605,7 @@ def apply(read: dict[str, Any], items: list[dict[str, Any]], issued: dict[str, A
             if b["outline_source"] == "人工确认":
                 changed = b["name"] in human_for or b["name"] not in polys or abs(b["area_m2"] - polys[b["name"]].area * m * m) > 0.001 * b["area_m2"]
                 b["outline_source"] = "人工修改" if changed else "人工复查通过"
-            elif b["outline_source"] == "AI 读出" and passed and not b["pending_items"]:
+            elif b["outline_source"] in {"AI 读出", "AI 定夺改判"} and passed and not b["pending_items"]:
                 b["outline_source"] = "人工复查通过"
     changed = [h for h, layer in issued["entities"].items() if returned["entities"].get(h) != layer]
     added_entities = [h for h in returned["entities"] if h not in issued["entities"]]
@@ -548,4 +618,4 @@ def apply(read: dict[str, Any], items: list[dict[str, Any]], issued: dict[str, A
             "operations_note": "以读回时发生变化（改图层、删除）或新增的图元数计"}
 
 
-__all__ = ["build_items", "mark_entities", "apply", "disagreement_items", "zone_items", "CONFIRM_LAYERS"]
+__all__ = ["build_items", "mark_entities", "apply", "adjudicated_items", "adjudication_note", "disagreement_items", "zone_items", "CONFIRM_LAYERS"]

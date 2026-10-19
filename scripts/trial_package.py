@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts import confirm_cad  # noqa: E402
-from scripts.write_agent_result_cad import ACCORE, _accore, _lisp_path, render, save_dwg, triptych  # noqa: E402
+from scripts.write_agent_result_cad import render, save_dwg, triptych  # noqa: E402
 
 GUIDE_IMAGES = ROOT / "docs/trial_guide"
 CATEGORY_CN = {"storage": "存储", "operation": "作业", "production": "生产", "office_living": "办公生活", "other": "其他", "unlabelled": "未标注", "to_confirm": "待确认"}
@@ -52,7 +52,7 @@ def run(args: argparse.Namespace) -> int:
     reads = out / "reads"
     reuse = args.reuse_reads and all((reads / f"run{n}" / "agent_read.json").is_file() for n in range(1, args.reads + 1))
     dxf = out / "source.dxf" if reuse else to_dxf(customer, out, args.timeout)
-    env = dict(os.environ, CTLE_AGENT="claude", PYTHONPATH=str(ROOT))
+    env = dict(os.environ, CTLE_AGENT=os.environ.get("CTLE_AGENT", "claude"), PYTHONPATH=str(ROOT))  # the AI backend is chosen by the caller
     procs = []
     for n in ([] if reuse else range(1, args.reads + 1)):
         cmd = [sys.executable, "-X", "utf8", "-m", "scripts.run_agent_reads", "--dxf", str(dxf), "--out", str(reads), "--only", str(n)]
@@ -67,6 +67,12 @@ def run(args: argparse.Namespace) -> int:
     if not works:
         raise SystemExit("no read finished; see read_*.log")
     works, dropped = rank_reads(works)
+    if not args.skip_adjudication:  # a read saved before the step existed gets it now (one agent call, only when there is a discrepancy)
+        from cad_to_layout.zero_manual import adjudicator
+
+        verdict = adjudicator.ensure(works[0], force=args.re_adjudicate, timeout_seconds=args.timeout * 2)
+        print(json.dumps({"adjudication": verdict.get("status"), "discrepancies": len(verdict.get("discrepancies") or []),
+                          "overrides": len(verdict.get("overrides") or []), "tokens_used": verdict.get("tokens_used")}, ensure_ascii=False), flush=True)
     issue_dir = out / "issue"
     confirm_cad.main(["issue", "--work", str(works[0]), *(["--other-work", *map(str, works[1:])] if works[1:] else []),
                       "--source-dxf", str(dxf), "--customer-dwg", str(customer), "--out", str(issue_dir)])
@@ -211,6 +217,9 @@ SHORT = {
     "outline_annex_left_out": "这一块与楼共墙，没算进楼，对吗（要＝并入；不要＝不并入）",
     "outline_inner_line": "这一侧轮廓可能走了里线",
     "dimension": "图上总尺寸与轮廓长度对不上（要＝轮廓对；不对就重描）",
+    "stated_area": "图上写的面积与量出的面积对不上（要＝轮廓对；不对就重描）",
+    "notches": "轮廓上有多处浅凹口（要＝真的凹进去；不是就沿连续外墙重描）",
+    "adjudicated": "定夺复核改判了轮廓（要＝新红线对；不对就重描）",
     "remeasure": "程序重新量的结果与读图报告对不上",
     "designated_missing": "指定的厂房没读出来，需要描出轮廓",
     "height": "读出的高度是不是净高",
@@ -219,6 +228,62 @@ SHORT = {
 
 ZONE_WORDS = ("功能区", "存储", "作业面积", "zones", "zone")  # doubts about zones: not part of the trial
 TECHNICAL = re.compile(r"\d{4,}|\de\d|\bF\d+|\bx\b|\by\b")  # drawing coordinates and face ids
+
+
+def drawing_says_rows(says: dict[str, Any]) -> list[tuple[str, float, str]]:
+    """The drawing's own numbers beside the measured ones (2026-10-16: 图上写的 / 量出的 side by side, never merged)."""
+
+    rows = []
+    dims = says.get("dimensions") or []
+    if dims:
+        parts = [f"{g['side']} {' / '.join(f'{v:g}' for v in g['dimensions_m'])} 米" + ("（与轮廓不一致，见编号）" if g.get("flagged") else "") for g in dims]
+        rows.append(("图上标注的总尺寸：" + "，".join(parts) + "（轴线或外墙尺寸，以图为准）", 10.5, "normal"))
+        if len(dims) == 2:
+            rect = dims[0]["dimensions_m"][-1] * dims[1]["dimensions_m"][-1]
+            rows.append((f"按图上总尺寸的矩形面积：{rect:,.0f} 平方米（长 × 宽，不扣凹凸，供对照）", 10.5, "normal"))
+    for a in says.get("areas") or []:
+        rows.append((f"图上写的面积：「{a['text']}」＝ {a['value_m2']:,.2f} 平方米" + (f"（与量出的相差 {a['differs_pct']:+.1f}%，见编号）" if a.get("flagged") else "（与量出的一致）"), 10.5, "normal"))
+    if not dims and not says.get("areas"):
+        rows.append(("图上没有找到这栋楼的总尺寸标注或面积注记，无法对照", 10.5, "normal"))
+    wrapped = []
+    for text, size, weight in rows:  # a long line of numbers is wrapped, never cut off at the page edge
+        for k, piece in enumerate(wrap_keep(text, 60)):
+            wrapped.append((("　　" if k else "") + piece, size, weight))
+    return wrapped
+
+
+def adjudication_rows(read: dict[str, Any], building: str, items: list[dict[str, Any]]) -> list[tuple[str, float, str]]:
+    """When the adjudication step replaced this building's numbers: what the AI read first, what it became and why (never silent)."""
+
+    over = next((o for o in (read.get("adjudication") or {}).get("overrides") or [] if o.get("building") == building), None)
+    if not over:
+        return []
+    before, hit = over.get("before") or {}, (over.get("matched") or [{}])[0]
+    mark = next((it["id"] for it in items if it["kind"] == "adjudicated" and it.get("building") == building), None)
+    text = (f"定夺复核改判：AI 原读出 {float(before.get('area_m2') or 0):,.0f} 平方米（长 {before.get('length_m')} × 宽 {before.get('width_m')} 米），"
+            f"上面的数是重量后的轮廓，与图上写的「{hit.get('drawing')}」一致（相差 {float(hit.get('differs_pct') or 0):+.2f}%）"
+            + (f"；改判前的轮廓画在编号 {mark} 的紫框里" if mark else ""))
+    return [(("　　" if k else "") + piece, 10.5, "normal") for k, piece in enumerate(wrap_keep(text, 60))]
+
+
+def adjudication_summary(read: dict[str, Any]) -> list[str]:
+    """One line on what the second AI did with the discrepancies, or that it was not needed / did not answer."""
+
+    adj = read.get("adjudication") or {}
+    status = adj.get("status")
+    if status in {None, "no_discrepancy", "no_building"}:
+        return [] if status != "no_discrepancy" else ["定夺复核：程序没有发现图上数字与轮廓的矛盾，第二个 AI 没有出场。"]
+    if status == "no_answer":
+        return ["定夺复核：第二个 AI 没有给出有效回答，矛盾全部交人复查。"]
+    verdicts = adj.get("verdicts") or []
+    right = sum(1 for v in verdicts if v["verdict"] == "outline_right")
+    changed = len(adj.get("overrides") or [])
+    wrong_kept = sum(1 for v in verdicts if v["verdict"] == "outline_wrong" and str(v.get("applied") or "").startswith("没有改判"))
+    unsure = sum(1 for v in verdicts if v["verdict"] == "cannot_decide")
+    cost = f"{int(adj.get('tokens_used') or 0):,} token、{adj.get('minutes')} 分钟、{adj.get('tool_calls')} 次工具调用" + ("，超出上限" if adj.get("over_budget") else "")
+    text = (f"定夺复核：第二个 AI 看了 {len(verdicts)} 条矛盾——认为轮廓对 {right}、改判 {changed}（只在重量结果与图上写的数一致时才改）、"
+            f"认为错但对不上图上的数没改 {wrong_kept}、没把握交人 {unsure}；{cost}。每条的理由写在上面对应编号下。")
+    return wrap_keep(text, 66)
 
 
 def other_floors(answer: dict[str, Any], building: dict[str, Any]) -> list[str]:
@@ -267,8 +332,11 @@ def area_report(path: Path, result: dict[str, Any], read: dict[str, Any], items:
             y -= 0.04
         for b in designated:
             src = next((x for x in answer.get("buildings", []) if x.get("name") == b["name"]), {})
+            check = next((c for c in read.get("checks") or [] if c.get("name") == b["name"]), {})
             rows = [(f"{b['name']}", 12.5, "bold"),
                     (f"总面积（占地）：{b['area_m2']:,.0f} 平方米　　长 {b.get('length_m', 0):.1f} 米 × 宽 {b.get('width_m', 0):.1f} 米", 12, "normal"),
+                    *drawing_says_rows(check.get("drawing_says") or {}),
+                    *adjudication_rows(read, b["name"], items),
                     ("净高：需客户提供（本产品不读高度）", 10.5, "normal"),
                     *([(f"图上有其他楼层，未计入：{'、'.join(floors)}", 10.5, "normal")] if (floors := other_floors(answer, src)) else []),
                     (f"来源：{b['outline_source']}　状态：{b['status']}", 9.5, "normal")]
@@ -285,12 +353,20 @@ def area_report(path: Path, result: dict[str, Any], read: dict[str, Any], items:
             what = f"「{it['zone']}」" if it.get("zone") else ""
             impact = float(it.get("impact_m2") or 0)
             said = SHORT.get(it["kind"], it["question"])
-            if it["kind"] == "dimension" and it.get("program_text"):  # the numbers say which side: 图上标注 42.0 m，轮廓 42.6 m
-                said = it["program_text"].split("：", 1)[-1].split("（影响")[0] + "（要＝轮廓对；不对就重描）"
+            if it["kind"] in {"dimension", "stated_area", "notches", "adjudicated"} and it.get("program_text"):  # the numbers say which side: 图上标注 42.0 m，轮廓 42.6 m
+                said = it["program_text"].split("：", 1)[-1].split("（影响")[0] + {"notches": "（要＝真的凹进去；不是就沿连续外墙重描）",
+                                                                                 "adjudicated": "（要＝新红线对；不对就重描）"}.get(it["kind"], "（要＝轮廓对；不对就重描）")
             line = f"{it['id']}  {what}{said}" + (f"（影响约 {impact:,.0f} m²）" if impact > 0 else "")
             for k, piece in enumerate(wrap_keep(line, 58)):
                 figure.text(0.08 if k == 0 else 0.11, y, piece, fontsize=9.5)
                 y -= 0.018
+            if it.get("adjudication"):  # the second AI's verdict on this mark, beside it: the reviewer sees what was checked and why
+                for k, piece in enumerate(wrap_keep("定夺复核：" + it["adjudication"]["said"], 62)[:5]):
+                    figure.text(0.11, y, piece, fontsize=8.5, color="#4b5563")
+                    y -= 0.016
+        for piece in adjudication_summary(read):
+            figure.text(0.06, y, piece, fontsize=8.5, color="#4b5563")
+            y -= 0.016
         notes = [u for u in answer.get("unresolved") or [] if not any(w in json.dumps(u, ensure_ascii=False) for w in ZONE_WORDS)
                  and "工具" not in str(u.get("item") or "") and not TECHNICAL.search(str(u.get("item") or ""))
                  and not any(w in str(u.get("item") or "") for w in ("高", "标高", "层数", "楼层"))][:4]  # height is not read; floors have their own line  # tool notes and coordinates mean nothing to the reviewer
@@ -458,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--reads", type=int, default=1, help="reads per drawing (2026-10-10: one; the reviewer checks the whole outline anyway)")
     p.add_argument("--reuse-reads", action="store_true", help="keep finished reads and only rebuild the marks and the package")
+    p.add_argument("--skip-adjudication", action="store_true", help="do not run the adjudication step on a read that lacks it (no agent call)")
+    p.add_argument("--re-adjudicate", action="store_true", help="run the adjudication step again on the kept read (one agent call)")
     p.add_argument("--timeout", type=float, default=900.0)
     p = sub.add_parser("finish")
     p.add_argument("--out", required=True)

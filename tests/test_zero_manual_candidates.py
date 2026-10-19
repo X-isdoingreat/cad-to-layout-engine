@@ -189,7 +189,7 @@ class OutlineCellTests(CandidateCase):
         self.assertEqual(result["zone_labels"][0]["kind"], "zone_label_inside_group_extent")
 
     def test_a_label_inside_one_cell_does_not_name_the_whole_group(self) -> None:
-        # 2026-10-10 (agreed): one label in one cell covers one of the group's cells, too few to name them all;
+        # 2026-10-10: one label in one cell covers one of the group's cells, too few to name them all;
         # the cells stay untyped candidates and the label is listed for the reviewer
         doc = _new()
         self._cells(doc, 0)

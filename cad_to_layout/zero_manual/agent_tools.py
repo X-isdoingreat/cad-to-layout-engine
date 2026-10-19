@@ -190,20 +190,37 @@ class Index:
         return sql, params
 
     def select(self, window: list[float], layers: list[str] | None = None, limit: int | None = None,
-               max_extent: float | None = None) -> list[dict[str, Any]]:
+               max_extent: float | None = None, min_extent: float | None = None, kind_like: str | None = None) -> list[dict[str, Any]]:
         sql, params = self._query("l.h, l.l, l.k, l.c, l.lt, l.w, l.p", window, layers)
         if max_extent is not None:  # width + height of the line's box, in drawing units: only small pieces are read
             sql += " AND l.size <= ?"
             params.append(max_extent)
+        if min_extent is not None:  # only pieces at least this big (walls, not hatching)
+            sql += " AND l.size >= ?"
+            params.append(min_extent)
+        if kind_like is not None:
+            sql += " AND l.k LIKE ?"
+            params.append(kind_like)
         if limit:
             sql += " ORDER BY l.size DESC LIMIT ?"  # the largest lines first: outlines before hatching and small symbols
             params.append(limit)
         return [{"h": h, "l": l, "k": k, "c": bool(c), "lt": lt, "w": w, "p": [tuple(q) for q in json.loads(p)]}
                 for h, l, k, c, lt, w, p in self.con.execute(sql, params)]
 
-    def count(self, window: list[float], layers: list[str] | None = None) -> int:
+    def count(self, window: list[float], layers: list[str] | None = None, min_extent: float | None = None) -> int:
         sql, params = self._query("COUNT(*)", window, layers)
+        if min_extent is not None:
+            sql += " AND l.size >= ?"
+            params.append(min_extent)
         return self.con.execute(sql, params).fetchone()[0]
+
+    def layer_sizes(self, window: list[float], min_extent: float) -> list[tuple[str, float, int]]:
+        """Layers in the window ranked by the summed box size of their pieces at least `min_extent` big: wall layers come first."""
+
+        sql, params = self._query("l.l, SUM(l.size), COUNT(*)", window, None)
+        sql += " AND l.size >= ? GROUP BY l.l ORDER BY SUM(l.size) DESC"
+        params.append(min_extent)
+        return [(layer, float(total), int(n)) for layer, total, n in self.con.execute(sql, params)]
 
 
 _OPEN: dict[str, Index] = {}
@@ -259,12 +276,25 @@ def cmd_overview(args: Any) -> dict[str, Any]:
             "sample_texts": [[t["t"], t["x"], t["y"], t["l"]] for t in sorted(short, key=lambda t: (-len(t["t"]), t["t"]))[:150]]}
 
 
+def _page(rows: list[Any], args: Any) -> dict[str, Any]:
+    """A page of a result list: the agent sees how many there are in all and how to get the rest (never a silent cut)."""
+
+    offset = max(0, int(getattr(args, "offset", 0) or 0))
+    limit = int(args.limit)
+    page = rows[offset: offset + limit]
+    out: dict[str, Any] = {"count": len(rows), "offset": offset, "shown": len(page)}
+    if offset + len(page) < len(rows):
+        out["note"] = f"{len(rows) - offset - len(page)} more: repeat with --offset {offset + len(page)} (or a narrower --match / window)"
+    return out
+
+
 def cmd_texts(args: Any) -> dict[str, Any]:
     idx = _load()
     rx = re.compile(args.match) if args.match else None
     out = [[t["t"], t["x"], t["y"], t["l"], t["h"]] for t in idx["texts"]
            if (rx is None or rx.search(t["t"])) and (not args.window or (args.window[0] <= t["x"] <= args.window[2] and args.window[1] <= t["y"] <= args.window[3]))]
-    return {"count": len(out), "texts": out[: args.limit]}
+    page = _page(out, args)
+    return {**page, "texts": out[page["offset"]: page["offset"] + args.limit]}
 
 
 def cmd_window(args: Any) -> dict[str, Any]:
@@ -272,15 +302,22 @@ def cmd_window(args: Any) -> dict[str, Any]:
     total = idx.count(args.box, args.layers)
     sel = _select(idx, args.box, args.layers, RENDER_LIMIT if total > RENDER_LIMIT else None)
     by_layer = Counter((ln["l"], ln["k"]) for ln in sel)
+    page = _page(sel, args)
     items = []
-    for ln in sel[: args.limit]:
+    for ln in sel[page["offset"]: page["offset"] + args.limit]:
         xs = [x for x, _ in ln["p"]]
         ys = [y for _, y in ln["p"]]
         length = sum(math.dist(a, b) for a, b in zip(ln["p"], ln["p"][1:]))
         items.append({"h": ln["h"], "layer": ln["l"], "kind": ln["k"], "bbox": [round(min(xs), 2), round(min(ys), 2), round(max(xs), 2), round(max(ys), 2)],
                       "length": round(length, 2), "linetype": ln.get("lt"), "weight": ln.get("w"), "curved": ln.get("c")})
     texts = [[t["t"], t["x"], t["y"], t["l"]] for t in idx["texts"] if args.box[0] <= t["x"] <= args.box[2] and args.box[1] <= t["y"] <= args.box[3]]
-    return {"objects": total, "by_layer_and_kind": [[l, k, n] for (l, k), n in by_layer.most_common(40)], "items": items, "texts": texts[:200]}
+    out = {"objects": total, "by_layer_and_kind": [[l, k, n] for (l, k), n in by_layer.most_common(40)], "items_count": page["count"], "items_offset": page["offset"],
+           "items": items, "texts_count": len(texts), "texts": texts[:200]}
+    if "note" in page:
+        out["note"] = "items: " + page["note"]
+    if len(texts) > 200:
+        out["texts_note"] = f"{len(texts)} texts in the window, 200 shown: use `texts --window ... --match ...` with --offset for the rest"
+    return out
 
 
 def cmd_render(args: Any) -> dict[str, Any]:
@@ -421,19 +458,182 @@ def cmd_envelope(args: Any) -> dict[str, Any]:
     return {"envelopes": shapes, "note": "outer outline of the selected lines with openings up to close_gaps_m closed; stored as faces, cite by id"}
 
 
+TRACE_MIN_LINE_M = 1.0  # pieces shorter than this (hatching, symbols, jambs) are left out of the outline candidates
+TRACE_CLOSE_GAPS_M = (2.0, 6.0)  # each layer set is traced with openings up to these closed
+TRACE_TOP_LAYERS = 5  # layer sets: each of the layers with the most long linework, alone and accumulated
+TRACE_POLYLINE_MIN_M2 = 100.0  # a closed polyline round the seed counts as a candidate from this area
+TRACE_SHOW = 12
+
+
+def _envelopes(sel: list[dict[str, Any]], m: float, close_m: float, min_area: float) -> list[Any]:
+    """Outer outline(s) of the linework with openings up to close_m closed: the filled parts, largest first."""
+
+    from shapely.geometry import LineString, Polygon
+    from shapely.ops import unary_union
+
+    lines = [LineString(ln["p"]) for ln in sel if len(ln["p"]) >= 2]
+    if not lines:
+        return []
+    half = close_m / 2.0 / m
+    grown = unary_union([line.buffer(half, cap_style=2, join_style=2) for line in lines])
+    out = []
+    for part in sorted(getattr(grown, "geoms", [grown]), key=lambda g: -g.area)[:5]:
+        filled = Polygon(part.exterior).buffer(-half, join_style=2)
+        if filled.is_empty or filled.area * m * m < min_area:
+            continue
+        if filled.geom_type != "Polygon":
+            filled = max(filled.geoms, key=lambda g: g.area)
+        out.append(filled.simplify(0.05 / m))
+    return out
+
+
+def _store_face(poly: Any, m: float, layers: list[str], made_by: str) -> tuple[str, dict[str, Any]]:
+    long_side, short_side, angle = _mrr(poly)
+    stored = json.loads(FACES.read_text(encoding="utf-8")) if FACES.is_file() else {}
+    fid = f"F{len(stored) + 1}"
+    stored[fid] = {"area_m2": round(poly.area * m * m, 2), "length_m": round(long_side * m, 2), "width_m": round(short_side * m, 2),
+                   "orientation_deg": round(angle, 2), "centroid": [round(poly.centroid.x, 3), round(poly.centroid.y, 3)], "texts_inside": [],
+                   "outline": [[round(x, 3), round(y, 3)] for x, y in poly.exterior.coords], "layers_used": sorted(layers)[:20], "made_by": made_by}
+    FACES.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+    return fid, stored[fid]
+
+
+def cmd_trace(args: Any) -> dict[str, Any]:
+    """Outline candidates round a point, each held against the numbers the drawing itself states.
+
+    2026-10-16, a two-storey plant: the agent traced the wall layer it chose and the trace dived into the corridors at every
+    opening wider than the gap it closed (−5.4%); the drawing carried the answer twice - a closed polyline on an
+    area layer (13,299.48 m², the figure written on the plan) and a continuous outer wall on the base layer.  So the
+    program does not pick a layer: it lists every candidate (closed polylines round the seed; the outer outline of
+    each layer with much long linework, alone and accumulated, at two closing widths) and ranks them by how many of
+    the drawing's own numbers they match - area notes in the window, end-to-end totals - nearest first.  Nothing is
+    adopted here; the agent cites the face it chooses and says why.
+    """
+
+    from shapely.geometry import Point, Polygon
+
+    idx = _load()
+    m = _m(idx, args.unit_m)
+    box = args.box
+    seed = Point(args.seed[0], args.seed[1])
+    min_size = args.min_line_m / m
+    pad = STATED_AREA_SEARCH_MARGIN_FRACTION * max(box[2] - box[0], box[3] - box[1])  # the plan's area note stands below or beside it
+    notes = stated_areas(idx, [box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad])
+    candidates: list[dict[str, Any]] = []
+
+    slack = 0.05 * max(box[2] - box[0], box[3] - box[1])
+
+    def consider(poly: Any, layers: list[str], made_by: str) -> None:
+        if poly.is_empty or not poly.is_valid or not poly.contains(seed):
+            return
+        bx = poly.bounds
+        if bx[0] < box[0] - slack or bx[1] < box[1] - slack or bx[2] > box[2] + slack or bx[3] > box[3] + slack:
+            return  # reaches beyond the view the agent gave: lines shared with the plan drawn next to it
+        for c in candidates:  # the same outline from two layer sets or closings: keep one
+            if abs(c["poly"].area - poly.area) <= 0.002 * poly.area and c["poly"].centroid.distance(poly.centroid) * m < 0.5:
+                c["also"].append(made_by)
+                return
+        candidates.append({"poly": poly, "layers": layers, "made_by": made_by, "also": []})
+
+    # 1. closed polylines drawn round the seed (an area outline, a building outline on any layer)
+    for ln in idx.select(box, None, min_extent=20.0 / m, kind_like="%POLYLINE"):
+        if len(ln["p"]) < 4 or math.dist(ln["p"][0], ln["p"][-1]) > 1e-6:  # the index repeats the first point of a closed polyline
+            continue
+        poly = Polygon(ln["p"])
+        if poly.is_valid and poly.area * m * m >= TRACE_POLYLINE_MIN_M2:
+            consider(poly, [ln["l"]], f"closed polyline on layer {ln['l']} (handle {ln['h']})")
+    # 2. the outer outline of the layer sets with the most long linework
+    ranked = [(layer, n) for layer, _, n in idx.layer_sizes(box, min_size)][:TRACE_TOP_LAYERS]
+    sets: list[list[str]] = []
+    for layers in ([list(args.layers)] if args.layers else []) + [[layer] for layer, _ in ranked] + [[layer for layer, _ in ranked[:k]] for k in range(2, len(ranked) + 1)]:
+        if layers not in sets:
+            sets.append(layers)
+    skipped = []
+    for layers in sets:
+        # every piece when the set is small enough (walls are often drawn in short pieces between openings);
+        # on a crowded layer (a base drawing with hatching) only the long pieces, and a set too big even then is skipped
+        total = idx.count(box, layers)
+        if total <= FACES_MAX_LINES:
+            sel, pieces = idx.select(box, layers), "all pieces"
+        elif idx.count(box, layers, min_extent=min_size) <= FACES_MAX_LINES:
+            sel, pieces = idx.select(box, layers, min_extent=min_size), f"pieces ≥ {args.min_line_m:g} m"
+        else:
+            skipped.append({"layers": layers, "lines": total})
+            continue
+        for close in args.close_gaps_m:
+            for poly in _envelopes(sel, m, close, TRACE_POLYLINE_MIN_M2):
+                consider(poly, layers, f"envelope of {'+'.join(layers)} ({pieces}, close_gaps_m={close:g})")
+    # 3. hold each against the drawing's own numbers
+    rows = []
+    for c in candidates:
+        poly = c["poly"]
+        area = poly.area * m * m
+        against = []
+        bx = poly.bounds
+        # a note further from this outline than that share of its mean side belongs to another plan (the floor drawn above it)
+        reach = STATED_AREA_SEARCH_MARGIN_FRACTION * ((bx[2] - bx[0]) + (bx[3] - bx[1])) / 2
+        for n in notes:
+            if not (STATED_AREA_COMPARABLE_RANGE[0] * area <= n["value_m2"] <= STATED_AREA_COMPARABLE_RANGE[1] * area):
+                continue
+            if not (bx[0] - reach <= n["at"][0] <= bx[2] + reach and bx[1] - reach <= n["at"][1] <= bx[3] + reach):
+                continue
+            differs = 100 * (area - n["value_m2"]) / n["value_m2"]
+            against.append({"kind": "stated_area", "text": n["text"], "value_m2": n["value_m2"], "at": n["at"], "differs_pct": round(differs, 2),
+                            "match": abs(differs) <= 100 * STATED_AREA_TOLERANCE_FRACTION})
+        seen: dict[tuple[str, float], int] = {}
+        for d in dimension_check([list(p) for p in poly.exterior.coords], m, idx):
+            key = (f"{d['outline_extent_m']:.1f}", d["dimension_m"])  # the same total drawn several times (both sides, a copy) counts once
+            if key in seen:
+                against[seen[key]]["drawn_times"] += 1
+                continue
+            seen[key] = len(against)
+            against.append({"kind": "dimension", "dimension_m": d["dimension_m"], "outline_extent_m": d["outline_extent_m"], "at": d["at"],
+                            "differs_pct": d["differs_pct"], "match": not d["flagged"], "drawn_times": 1})
+        matched = [a for a in against if a["match"]]
+        area_gap = min((abs(a["differs_pct"]) for a in against if a["kind"] == "stated_area"), default=None)
+        rows.append({"poly": poly, "layers": c["layers"], "made_by": c["made_by"], "also": c["also"], "against_drawing": against,
+                     "matches": len(matched), "area_gap_pct": area_gap, "area_m2": area})
+    rows.sort(key=lambda r: (-r["matches"], r["area_gap_pct"] if r["area_gap_pct"] is not None else 1e9, -r["area_m2"]))
+    shown = []
+    for r in rows[:TRACE_SHOW]:
+        fid, face = _store_face(r["poly"], m, r["layers"], "trace: " + r["made_by"])
+        shown.append({"id": fid, **{k: face[k] for k in ("area_m2", "length_m", "width_m", "orientation_deg")}, "made_by": r["made_by"],
+                      "same_outline_from": r["also"], "matches_drawing": r["matches"], "against_drawing": r["against_drawing"]})
+    biggest = max((r["area_m2"] for r in rows), default=0.0)
+    comparable = [n for n in notes if n["value_m2"] >= STATED_AREA_COMPARABLE_RANGE[0] * biggest * 0.5]  # room notes are left out of the listing
+    return {"candidates": shown, "candidates_total": len(rows),
+            "area_notes_near_window": [{"text": n["text"], "value_m2": n["value_m2"], "at": n["at"]} for n in comparable], "area_notes_total": len(notes),
+            "layers_ranked_by_long_linework": [{"layer": layer, "pieces": n} for layer, n in ranked], "skipped_too_many_lines": skipped,
+            "note": "every candidate contains the seed and is stored as a face; `against_drawing` holds the area notes and end-to-end totals it was compared with "
+                    "(`match` = within the tolerance). Render the best ones with --faces and pick the one that follows the outer face of the exterior wall "
+                    "AND agrees with the drawing's numbers; if none agrees, say so - do not pick by size"}
+
+
 def cmd_dimensions(args: Any) -> dict[str, Any]:
     """Linear dimensions drawn on the drawing (their measured points inside the window), longest first."""
 
     idx = _load()
     m = _m(idx, args.unit_m)
-    box = args.box
+    if args.box and len(args.box) != 4:
+        return {"error": "give the window as x1 y1 x2 y2, or no window for the whole drawing"}
+    box = args.box or idx["extent"] or [-1e18, -1e18, 1e18, 1e18]  # no window: the whole drawing (a total is often drawn outside the window the agent chose)
+    rx = re.compile(args.match) if getattr(args, "match", None) else None
+    want = getattr(args, "length_m", None)
     rows = []
     for d in idx.dims:
-        if all(box[0] <= p[0] <= box[2] and box[1] <= p[1] <= box[3] for p in (d["a"], d["b"])):
-            rows.append({"length_m": round(d["length"] * m, 3), "shown_text": d["shown"] or None, "from": d["a"], "to": d["b"], "layer": d["l"]})
-    rows.sort(key=lambda r: -r["length_m"])
-    return {"count": len(rows), "dimensions": rows[: args.limit],
-            "note": "shown_text is a text override when the drawer typed one (<> = the measured value); compare the longest ones with your building's length and width"}
+        if not all(box[0] <= p[0] <= box[2] and box[1] <= p[1] <= box[3] for p in (d["a"], d["b"])):
+            continue
+        length_m = d["length"] * m
+        if rx is not None and not rx.search(d["shown"] or ""):
+            continue
+        if want is not None and abs(length_m - want) > max(DIMENSION_TOLERANCE_FRACTION * want, DIMENSION_WALL_ALLOWANCE_M):
+            continue
+        rows.append({"length_m": round(length_m, 3), "shown_text": d["shown"] or None, "from": d["a"], "to": d["b"], "layer": d["l"]})
+    rows.sort(key=lambda r: (abs(r["length_m"] - want) if want is not None else -r["length_m"]))
+    page = _page(rows, args)
+    return {**page, "window": [round(v, 1) for v in box], "dimensions": rows[page["offset"]: page["offset"] + args.limit],
+            "note": "shown_text is a text override when the drawer typed one (<> = the measured value); compare the longest ones with your building's length and width"
+                    + ("" if args.box else "; searched the whole drawing") + ("" if want is None else f"; only lengths within max(1%, 1 m) of {want} m, nearest first")}
 
 
 ELEVATION_TEXT = re.compile(r"(?:^|[^\d.])([±+\-]?\d{1,3}\.\d{3})(?:$|[^\d])")
@@ -504,29 +704,126 @@ def cmd_zones(args: Any) -> dict[str, Any]:
 
 
 def dimension_check(outline: list[list[float]], m: float, idx: Any | None = None) -> list[dict[str, Any]]:
-    """Dimensions measuring this outline from end to end, compared with its extent in the same direction."""
+    """Dimensions measuring this outline from end to end, compared with its extent in the same direction.
+
+    A total dimension is drawn beside the building, not on it (2026-10-16: 6 m outside the walls on a real drawing),
+    so a dimension counts when it lies within `DIMENSION_OFFSET_MAX_FRACTION` of the extent from the outline and its
+    span covers at least `DIMENSION_END_TO_END_MIN_FRACTION` of the outline in its own direction.  `flagged` is set
+    when the difference exceeds max(1%, `DIMENSION_WALL_ALLOWANCE_M`): axis-to-axis totals are shorter than the
+    outer wall by the wall thickness, and that is not an error.
+    """
 
     from shapely.geometry import Point, Polygon
 
     idx = idx or _load()
     poly = Polygon(outline)
-    near = COLUMN_ON_OUTLINE_M / m
     out = []
     for d in idx.dims:
         a, b = d["a"], d["b"]
-        ends = sorted(poly.exterior.distance(Point(p)) for p in (a, b))
-        # starts on the outline and ends on it or not far off it (an outline measured too short still gets compared)
-        if d["length"] <= 0 or ends[0] > near or ends[1] > max(near, 0.25 * d["length"]):
+        span = math.dist(a, b)
+        if d["length"] <= 0 or span <= 0:
             continue
-        ux, uy = (b[0] - a[0]) / max(math.dist(a, b), 1e-12), (b[1] - a[1]) / max(math.dist(a, b), 1e-12)
+        ux, uy = (b[0] - a[0]) / span, (b[1] - a[1]) / span
         proj = [x * ux + y * uy for x, y in poly.exterior.coords]
-        extent = (max(proj) - min(proj)) * m
+        lo, hi = min(proj), max(proj)
+        extent = hi - lo
+        pa, pb = sorted((a[0] * ux + a[1] * uy, b[0] * ux + b[1] * uy))
+        covered = min(pb, hi) - max(pa, lo)
+        if extent <= 0 or covered < DIMENSION_END_TO_END_MIN_FRACTION * extent or d["length"] < DIMENSION_END_TO_END_MIN_FRACTION * extent:
+            continue  # a part dimension (one bay, a door) or one measuring something else
+        offset = min(poly.exterior.distance(Point(p)) for p in (a, b))
+        if offset > DIMENSION_OFFSET_MAX_FRACTION * extent:
+            continue  # drawn too far away to be this building's dimension (another plan, a site total)
         length = d["length"] * m
-        if length < 0.9 * extent:
-            continue  # a part dimension (one bay, a door), not end to end
-        out.append({"dimension_m": round(length, 3), "outline_extent_m": round(extent, 3), "differs_pct": round(100 * (extent - length) / length, 2),
-                    "shown_text": d["shown"] or None, "handle": d["h"]})
+        extent_m = extent * m
+        differs_m = extent_m - length
+        out.append({"dimension_m": round(length, 3), "outline_extent_m": round(extent_m, 3), "differs_pct": round(100 * differs_m / length, 2),
+                    "flagged": abs(differs_m) > max(DIMENSION_TOLERANCE_FRACTION * length, DIMENSION_WALL_ALLOWANCE_M),
+                    "shown_text": d["shown"] or None, "handle": d["h"], "at": [round((a[0] + b[0]) / 2, 3), round((a[1] + b[1]) / 2, 3)]})
     return out
+
+
+_AREA_NOTE = re.compile(r"(面积|建筑面积|占地)?[^\d]{0,6}?(\d[\d,]*(?:\.\d+)?)\s*(m2|M2|㎡|m²|M²|平方米|平米)|(本层面积|建筑面积|总面积|占地面积|面积)[:：\s]*(\d[\d,]*(?:\.\d+)?)")
+
+
+def stated_areas(idx: Any, window: list[float]) -> list[dict[str, Any]]:
+    """Area numbers written on the drawing inside the window: the text, the value in m² and where it stands."""
+
+    out = []
+    for t in idx.texts:
+        if not (window[0] <= t["x"] <= window[2] and window[1] <= t["y"] <= window[3]):
+            continue
+        hit = _AREA_NOTE.search(t["t"].replace(" ", ""))
+        if hit is None:
+            continue
+        raw = hit.group(2) or hit.group(5)
+        try:
+            value = float(raw.replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out.append({"text": t["t"].strip(), "value_m2": value, "at": [t["x"], t["y"]], "handle": t["h"], "layer": t["l"]})
+    return out
+
+
+# a note labelled with one of these words states a part of the floor (a fire compartment, a zone, a room), not the building
+PARTIAL_AREA_WORDS = ("分区", "防火", "区域", "房间", "室")
+
+
+def stated_area_check(outline: list[list[float]], area_m2: float, m: float, idx: Any | None = None) -> dict[str, Any]:
+    """Area notes written near the outline (within `STATED_AREA_SEARCH_MARGIN_FRACTION` of its size) against the measured area.
+
+    Only notes of a comparable size (`STATED_AREA_COMPARABLE_RANGE` × the measured area) and not labelled as a part
+    (`PARTIAL_AREA_WORDS`, in the note or in the text standing within `STATED_AREA_LABEL_REACH_M` of it) are compared;
+    the others are only counted.  `flagged` beyond `STATED_AREA_TOLERANCE_FRACTION`.
+    """
+
+    idx = idx or _load()
+    xs = [p[0] for p in outline]
+    ys = [p[1] for p in outline]
+    margin = STATED_AREA_SEARCH_MARGIN_FRACTION * max(max(xs) - min(xs), max(ys) - min(ys))
+    window = [min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin]
+    reach = STATED_AREA_LABEL_REACH_M / m
+    compared, skipped = [], Counter()
+    for note in stated_areas(idx, window):
+        lo, hi = STATED_AREA_COMPARABLE_RANGE
+        if not (area_m2 > 0 and lo * area_m2 <= note["value_m2"] <= hi * area_m2):
+            skipped["other_size"] += 1
+            continue
+        x, y = note["at"]
+        labels = sorted((math.dist((t["x"], t["y"]), (x, y)), t["t"].strip()) for t in idx.texts
+                        if t["h"] != note["handle"] and abs(t["x"] - x) <= reach and abs(t["y"] - y) <= reach)
+        label = labels[0][1] if labels else ""
+        if any(w in note["text"] or w in label for w in PARTIAL_AREA_WORDS):
+            skipped["part_of_floor"] += 1
+            continue
+        differs = 100 * (area_m2 - note["value_m2"]) / note["value_m2"]
+        compared.append({**note, "label": label, "measured_m2": round(area_m2, 2), "differs_pct": round(differs, 2),
+                         "flagged": abs(differs) > 100 * STATED_AREA_TOLERANCE_FRACTION})
+    return {"compared": compared, "not_compared": dict(skipped)}
+
+
+def notch_check(outline: list[list[float]], m: float) -> dict[str, Any]:
+    """Shallow notches cut into the outline: what a closing by `NOTCH_CLOSE_M` fills in.
+
+    An automatic trace that follows an inner line where the outer wall has an opening leaves a notch a few metres
+    deep (2026-10-16: ~20 of them on one floor, −5.4% of the area).  An L- or U-shaped building is wider than
+    2 × `NOTCH_CLOSE_M` at its re-entrant corner and is not filled.  The pieces are returned to be drawn for a person.
+    """
+
+    from shapely.geometry import Polygon
+
+    poly = Polygon(outline)
+    poly = poly if poly.is_valid else poly.buffer(0)
+    if poly.is_empty:
+        return {"notches": 0, "filled_m2": 0.0, "share": 0.0, "flagged": False, "polygons": []}
+    d = NOTCH_CLOSE_M / m
+    filled = poly.buffer(d, join_style=2).buffer(-d, join_style=2).difference(poly)
+    pieces = [g for g in getattr(filled, "geoms", [filled]) if not g.is_empty and g.geom_type == "Polygon" and g.area * m * m >= 1.0]
+    total = sum(g.area for g in pieces) * m * m
+    share = total / max(poly.area * m * m, 1e-9)
+    return {"notches": len(pieces), "filled_m2": round(total, 1), "share": round(share, 4), "flagged": share >= NOTCH_MIN_SHARE,
+            "polygons": [[[round(x, 3), round(y, 3)] for x, y in g.exterior.coords] for g in sorted(pieces, key=lambda g: -g.area)]}
 
 
 def cmd_corners(args: Any) -> dict[str, Any]:
@@ -899,6 +1196,18 @@ GRID_SYMBOL_MIN_M = 0.15  # linework at a grid crossing at least this wide both 
 COLUMN_ON_OUTLINE_M = 1.5  # a column this close to a building outline belongs to it (same value as constants.COLUMN_ON_OUTLINE_M)
 GRID_LINE_TOLERANCE_M = 1.0  # columns whose cross coordinate differs by at most this stand on one column line
 
+# Cross-checks of a measured outline against what the drawing itself says (TUNING_LEDGER 2026-10-16)
+DIMENSION_OFFSET_MAX_FRACTION = 0.25  # a total dimension is drawn within this share of the extent beside the building
+DIMENSION_END_TO_END_MIN_FRACTION = 0.9  # ... and covers at least this share of the outline in its direction
+DIMENSION_TOLERANCE_FRACTION = 0.01
+DIMENSION_WALL_ALLOWANCE_M = 1.0  # an axis-to-axis total is shorter than the outer wall by the wall thickness
+STATED_AREA_SEARCH_MARGIN_FRACTION = 0.2  # area notes stand below or beside the plan, within this share of its size
+STATED_AREA_COMPARABLE_RANGE = (0.5, 2.0)  # a note this close to the measured area is about the same building
+STATED_AREA_TOLERANCE_FRACTION = 0.01
+STATED_AREA_LABEL_REACH_M = 3.0  # the text standing this close to a bare area number is its label (防火分区2  11953平方米)
+NOTCH_CLOSE_M = 8.0  # notches narrower than twice this are filled by the closing and marked
+NOTCH_MIN_SHARE = 0.01  # ... when together they reach this share of the area
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent_tools")
@@ -906,12 +1215,17 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("index"); p.add_argument("dxf")
     sub.add_parser("overview")
     p = sub.add_parser("texts"); p.add_argument("--match"); p.add_argument("--window", nargs=4, type=float); p.add_argument("--limit", type=int, default=300)
+    p.add_argument("--offset", type=int, default=0)
     p = sub.add_parser("window"); p.add_argument("box", nargs=4, type=float); p.add_argument("--layers", nargs="*"); p.add_argument("--limit", type=int, default=150)
+    p.add_argument("--offset", type=int, default=0)
     p = sub.add_parser("render"); p.add_argument("box", nargs=4, type=float); p.add_argument("out"); p.add_argument("--layers", nargs="*"); p.add_argument("--faces", nargs="*"); p.add_argument("--no-text", action="store_true")
     p = sub.add_parser("around"); p.add_argument("face_ids", nargs="+"); p.add_argument("--layers", nargs="*"); p.add_argument("--unit-m", type=float)
     p.add_argument("--margin-m", type=float, default=40.0); p.add_argument("--gap", type=float, default=1.0); p.add_argument("--min-area", type=float, default=5.0)
     p = sub.add_parser("envelope"); p.add_argument("box", nargs=4, type=float); p.add_argument("--layers", nargs="*"); p.add_argument("--unit-m", type=float)
     p.add_argument("--close-gaps-m", type=float, default=6.0); p.add_argument("--min-area", type=float, default=20.0)
+    p = sub.add_parser("trace"); p.add_argument("box", nargs=4, type=float); p.add_argument("--seed", nargs=2, type=float, required=True, help="a point inside the building")
+    p.add_argument("--layers", nargs="*", help="a layer set to trace first, besides the ones ranked automatically"); p.add_argument("--unit-m", type=float)
+    p.add_argument("--min-line-m", type=float, default=TRACE_MIN_LINE_M); p.add_argument("--close-gaps-m", nargs="+", type=float, default=list(TRACE_CLOSE_GAPS_M))
     p = sub.add_parser("elevations"); p.add_argument("box", nargs=4, type=float); p.add_argument("--unit-m", type=float)
     p.add_argument("--near-m", type=float, default=5.0); p.add_argument("--limit", type=int, default=150)
     p = sub.add_parser("corners"); p.add_argument("points", nargs="+", type=float); p.add_argument("--layers", nargs="*"); p.add_argument("--unit-m", type=float)
@@ -919,7 +1233,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--nearest", dest="outer", action="store_false", help="snap to the nearest point instead of the outermost one")
     p = sub.add_parser("zones"); p.add_argument("box", nargs=4, type=float); p.add_argument("--layers", nargs="*"); p.add_argument("--unit-m", type=float)
     p.add_argument("--match"); p.add_argument("--gap", type=float, default=1.0); p.add_argument("--min-area", type=float, default=2.0)
-    p = sub.add_parser("dimensions"); p.add_argument("box", nargs=4, type=float); p.add_argument("--unit-m", type=float); p.add_argument("--limit", type=int, default=60)
+    p = sub.add_parser("dimensions"); p.add_argument("box", nargs="*", type=float, help="x1 y1 x2 y2; omitted = the whole drawing"); p.add_argument("--unit-m", type=float)
+    p.add_argument("--limit", type=int, default=60); p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--match", help="regex on the shown text"); p.add_argument("--length-m", type=float, help="only dimensions of about this length (max(1%%, 1 m)), nearest first")
     p = sub.add_parser("column_instances"); p.add_argument("box", nargs=4, type=float); p.add_argument("--groups", nargs="+", type=int, required=True)
     p.add_argument("--faces", nargs="*"); p.add_argument("--layers", nargs="*"); p.add_argument("--unit-m", type=float); p.add_argument("--max-size", type=float, default=1.5)
     for name in ("faces", "measure", "columns"):
@@ -939,7 +1255,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         result = {"overview": cmd_overview, "texts": cmd_texts, "window": cmd_window, "render": cmd_render, "faces": cmd_faces,
                   "measure": cmd_measure, "columns": cmd_columns, "envelope": cmd_envelope, "around": cmd_around,
-                  "column_instances": cmd_column_instances, "dimensions": cmd_dimensions,
+                  "column_instances": cmd_column_instances, "dimensions": cmd_dimensions, "trace": cmd_trace,
                   "elevations": cmd_elevations, "zones": cmd_zones, "corners": cmd_corners}[args.cmd](args)
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0

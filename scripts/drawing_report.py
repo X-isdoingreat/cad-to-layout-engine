@@ -161,8 +161,8 @@ def equipment_pages(pdf: Any, pyplot: Any, run: Path, building_at: list[float] |
     per_view = Counter(r["view_id"] for r in counted)
     if not per_view:
         figure = pyplot.figure(figsize=PAGE)
-        _words(figure, "二、设备清单", [("本图未识别到仓储设备。", 13, "bold"),
-                                    ("可能图纸中没有设备，或设备以散线绘制（当前版本暂不支持此类画法）。", 10.5, "normal")])
+        _words(figure, "二、设备清单", [("本图没有按设备图块识别到仓储设备。", 13, "bold"),
+                                    ("可能图纸中没有设备，或设备以散线、零件拼画；这类画法按重复图形统计（加 --repeat 时见下一页）。", 10.5, "normal")])
         pdf.savefig(figure)
         pyplot.close(figure)
         return
@@ -333,6 +333,88 @@ def equipment_pages(pdf: Any, pyplot: Any, run: Path, building_at: list[float] |
     index.con.close()
 
 
+def repeat_pages(pdf: Any, pyplot: Any, run: Path, summary: dict[str, Any]) -> None:
+    """One page per plan where the program counted repeated linework (equipment drawn as loose lines or parts): the
+    places coloured per group, the program's example in a red box, and the questions."""
+
+    from matplotlib import image as mpimg
+    from matplotlib import patches
+
+    from scripts.equipment_review import REPEAT_COLOURS, repeats
+
+    found = repeats(run)
+    if not found["views"]:
+        return
+    _, views, _ = _load(run)
+    title = {k: " ".join(str((v.get("title") or {}).get("text") or f"平面图（{n}，图上无标题）").split()) for n, (k, v) in enumerate(views.items(), 1)}
+    index = _index(run, run / "review")
+    # what the AI calls "not equipment" is not hidden (the AI can be wrong: a rack cell straddling two rows looked like
+    # steel beams to it); those groups go together on one page for a glance, uncounted unless the person names them
+    shown = [v for v in found["views"] if (v["groups"][0].get("suggestion") or {}).get("type") != "NOT_EQUIPMENT"]
+    doubted = [v for v in found["views"] if v not in shown]
+    for view in shown:
+        groups = view["groups"]
+        cells = [c for g in groups for c in g["places"]]
+        pad = max(max(c[2] for c in cells) - min(c[0] for c in cells), max(c[3] for c in cells) - min(c[1] for c in cells)) * 0.05 + 2000
+        window = [min(c[0] for c in cells) - pad, min(c[1] for c in cells) - pad, max(c[2] for c in cells) + pad, max(c[3] for c in cells) + pad]
+        figure = pyplot.figure(figsize=PAGE)
+        axis = figure.add_axes(PICTURE)
+        _lines(axis, index, window)
+        for g, colour in zip(groups, REPEAT_COLOURS):
+            for c in g["places"]:
+                axis.add_patch(patches.Rectangle((c[0], c[1]), c[2] - c[0], c[3] - c[1], edgecolor=colour, facecolor=colour, alpha=0.45, linewidth=0.3))
+            e = g["example"]
+            axis.add_patch(patches.Rectangle((e[0], e[1]), e[2] - e[0], e[3] - e[1], edgecolor="#111827", facecolor="none", linewidth=2.2))
+            axis.annotate(g["id"], ((e[0] + e[2]) / 2, e[3]), xytext=(0, 14), textcoords="offset points", ha="center", fontsize=11, weight="bold",
+                          color=colour, arrowprops={"arrowstyle": "-", "color": colour})
+        first = groups[0]
+        s = first.get("suggestion") or {}
+        guess = "无法判断" if s.get("type") in (None, "UNSURE") else ((s.get("name") or label(s["type"])) if s["type"] == "OTHER_EQUIPMENT" else label(s["type"]))
+        u = unit(s.get("type", "")) if s.get("type") not in (None, "UNSURE") else "处"
+        e = first["example"]
+        each = f"每个红框算几{u}" if u != "处" else "每个红框算几台"
+        lines = [(f"{first['id']}　系统在图上找到 {len(first['places']):,} 处相同图形（红色）", 12, "bold"),
+                 (f"系统识别为：{guess}" + (f"（把握：{confidence(s['votes'])}）" if s.get("votes") else "") + f"，是否正确？{each}？", 11, "normal"),
+                 (f"样例为黑框处，{round(e[2] - e[0]):,} × {round(e[3] - e[1]):,} mm，见右下小图红框。一个框可能跨两排背靠背的货架，请按小图数。", 10, "normal"),
+                 ("", 0, "")]
+        for g in groups[1:]:
+            lines.append((f"{g['id']}　另有 {len(g['places']):,} 处相似图形（{['', '橙色', '紫色', '青色'][groups.index(g)]}）：也是{guess}吗？", 11, "bold"))
+        lines += [("", 0, ""), ("这类设备没有单独的图块（散线或零件拼画），数量由系统按重复图形统计：先自己挑一个样例，再在全图找相同的（含镜像）。"
+                                "后面的编号是系统拿不准的，未计入数量。", 9.5, "normal")]
+        _words(figure, f"二、设备清单：按重复图形计数（{title.get(view['view_id'], '')[:14]}）", lines)
+        picture = run / "review" / "repeat" / f"{first['id']}.png"
+        if picture.is_file():
+            inset = figure.add_axes([0.68, 0.05, 0.30, 0.30])
+            inset.imshow(mpimg.imread(picture))
+            inset.axis("off")
+        pdf.savefig(figure)
+        pyplot.close(figure)
+        summary.setdefault("repeat", []).append({"floor": title.get(view["view_id"], ""), "id": first["id"], "count": len(first["places"]),
+                                                 "guess": guess, "unit": u, "questions": [g["id"] for g in groups[1:]]})
+        summary.setdefault("questions", []).extend(g["id"] for g in groups)
+    if doubted:
+        figure, axes = pyplot.subplots(2, 3, figsize=PAGE)
+        figure.text(0.02, 0.955, "二、设备清单：系统认为不是设备的重复图形（请看一眼）", fontsize=16, weight="bold")
+        for axis, view in zip(axes.flat, doubted[:6]):
+            first = view["groups"][0]
+            picture = run / "review" / "repeat" / f"{first['id']}.png"
+            if picture.is_file():
+                axis.imshow(mpimg.imread(picture))
+            axis.axis("off")
+            what = (first.get("suggestion") or {}).get("name") or "非设备"
+            axis.set_title(f"{first['id']}　{title.get(view['view_id'], '')[:12]}：{len(first['places']):,} 处\n系统认为：{what[:14]}（不是设备）", fontsize=10, loc="left")
+        for axis in list(axes.flat)[len(doubted[:6]):]:
+            axis.axis("off")
+        figure.text(0.02, 0.02, "这些未计入数量。如果其中有设备，请回复编号、类型和每处几格，例如“R1 是货架，每处 2 格”。每格左为样例，右为它在原图中的位置（红框）。",
+                    fontsize=10)
+        figure.tight_layout(rect=(0, 0.05, 1, 0.93))
+        pdf.savefig(figure)
+        pyplot.close(figure)
+        summary["repeat_doubted"] = [v["groups"][0]["id"] for v in doubted]
+        summary.setdefault("questions", []).extend(summary["repeat_doubted"])
+    index.con.close()
+
+
 def conclusion(pyplot: Any, drawing: str, area: dict[str, Any] | None, equipment: dict[str, Any]) -> Any:
     figure = pyplot.figure(figsize=PAGE)
     figure.text(0.06, 0.88, "图纸识别报告", fontsize=28, weight="bold")
@@ -345,24 +427,34 @@ def conclusion(pyplot: Any, drawing: str, area: dict[str, Any] | None, equipment
         rows.append(("厂房", f"{area['name'][:20]}：总面积 {area['area_m2']:,.0f} 平方米，长 {area.get('length_m', 0):.1f} × 宽 {area.get('width_m', 0):.1f} 米"))
     if equipment.get("counts"):
         main = "、".join(f"{label(t)} {n:,} {unit(t)}" for t, n in equipment["counts"].most_common())[:80]
-        rows.append(("设备", f"{equipment['floor']}：{main}"))
+        rows.append(("设备", f"{equipment['floor']}：{main}（按设备图块统计）"
+                     + ("。本图还有按重复图形统计的结果（下面“重复图形”一行）：散线画的设备按图块读不准，两者不一致时以重复图形和人工确认为准。"
+                        if equipment.get("repeat") or equipment.get("repeat_doubted") else "")))
         share = equipment["by_text"] / max(equipment["records"], 1)
         o = equipment.get("open") or {}
         questions = len(equipment.get("questions") or [])
         rows.append(("识别可靠性", f"设备位置和数量由系统直接从图纸统计；" + (f"{share:.0%} 的设备按图纸文字识别，其余按形状识别。" if share > 0 else "类型全部按形状识别（图纸上没有可用的设备名称）。")
                                  + (f"有 {questions} 处需要您确认（第三部分）。" if questions else "")))
-    elif equipment:
+    elif equipment and not equipment.get("repeat"):
         rows.append(("设备", "本图未识别到仓储设备。"))
+    if equipment.get("repeat_doubted"):
+        rows.append(("请看一眼", f"另有 {len(equipment['repeat_doubted'])} 组重复图形系统认为不是设备（{'、'.join(equipment['repeat_doubted'])}），未计入；如有设备请指出。"))
+    for r in equipment.get("repeat") or []:
+        rows.append(("重复图形", f"{r['floor'][:14]}：{r['guess']} {r['count']:,} 处（{r['id']}，系统按重复图形统计，每处算几{r['unit'] if r['unit'] != '处' else '台'}待您确认）"
+                     + (f"；另有 {len(r['questions'])} 组拿不准（{'、'.join(r['questions'])}），未计入" if r["questions"] else "")))
     rows.append(("状态", "以上为系统识别结果，尚未经人工核对。"))
     if equipment.get("questions"):
         q = [x for x in equipment["questions"] if x.startswith("E")]
-        example = ("面积正确。" if area else "") + (f"{q[0]} 正确，" if q else "") + (f"{q[1]} 是货架，" if len(q) > 1 else "") + "其余正确；左下角一排输送机未识别。"
+        rq = [x for x in equipment["questions"] if x.startswith("R")]
+        example = ("面积正确。" if area else "") + (f"{q[0]} 正确，" if q else "") + (f"{q[1]} 是货架，" if len(q) > 1 else "")             + (f"{rq[0]} 对、每处 2 格，" if rq else "") + (f"{rq[1]} 是，" if len(rq) > 1 else "") + (f"{rq[2]} 不是，" if len(rq) > 2 else "") + "其余正确；左下角一排输送机未识别。"
         rows.append(("如何回复", f"直接用一句话回复编号和判断即可，例如：“{example}”"))
+    lines = sum(len(wrap_keep(text, 46)) for _, text in rows)
+    size, width, step = (14, 46, 0.045) if lines <= 9 else (12, 56, 0.037)  # more rows: smaller, so the page holds them
     for head, text in rows:
-        figure.text(0.06, y, head, fontsize=14, weight="bold", color="#1f2937")
-        for k, piece in enumerate(wrap_keep(text, 46)):
-            figure.text(0.18, y - k * 0.045, piece, fontsize=14)
-        y -= 0.045 * max(1, len(wrap_keep(text, 46))) + 0.03
+        figure.text(0.06, y, head, fontsize=size, weight="bold", color="#1f2937")
+        for k, piece in enumerate(wrap_keep(text, width)):
+            figure.text(0.18, y - k * step, piece, fontsize=size)
+        y -= step * max(1, len(wrap_keep(text, width))) + 0.025
     figure.text(0.06, 0.06, "识别时图纸内容会发送至 Anthropic 的 AI 服务处理，请事先征得图纸所有者同意。设备样式明细见同名附录文件；需要放大核对时，请打开同名的核对用 DWG。", fontsize=10, color="#4b5563")
     return figure
 
@@ -375,6 +467,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--area")
     parser.add_argument("--equipment")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--repeat", action="store_true", help="also count equipment drawn as loose lines or parts by repeated linework (slow on large plans)")
     args = parser.parse_args(argv)
     pyplot = _matplotlib()
     out = Path(args.out)
@@ -389,6 +482,8 @@ def main(argv: list[str] | None = None) -> int:
             area_info = next((b for b in result["buildings"] if b.get("designated")), None)
         if args.equipment:
             equipment_pages(pdf, pyplot, Path(args.equipment), building_at, appendix, summary)
+            if args.repeat:
+                repeat_pages(pdf, pyplot, Path(args.equipment), summary)
     import fitz
 
     front = out.with_name(out.stem + "_front.pdf")

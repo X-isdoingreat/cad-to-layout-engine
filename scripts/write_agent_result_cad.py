@@ -25,13 +25,11 @@ import json
 import math
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import ezdxf
 
-ACCORE = Path("C:/Program Files/Autodesk/AutoCAD 2025/accoreconsole.exe")
 LAYERS = {"CTLE_BUILDING": 1, "CTLE_BUILDING_LABEL": 1, "CTLE_SEMI_OUTDOOR": 2, "CTLE_COLUMN": 5,
           "CTLE_ZONE_STORAGE": 3, "CTLE_ZONE_OPERATION": 4, "CTLE_ZONE_OTHER": 8}
 ZONE_LAYER = {"storage": "CTLE_ZONE_STORAGE", "operation": "CTLE_ZONE_OPERATION"}
@@ -125,11 +123,6 @@ def write_result_dxf(source_dxf: Path, entities: list[dict[str, Any]], target: P
     doc.saveas(target)
     return manifest
 
-
-def _accore(dwg: Path, script: str, scr: Path, *, readonly: bool, timeout: float) -> int:
-    scr.write_text(script, encoding="utf-8", newline="\n")
-    command = [str(ACCORE), "/i", str(dwg), "/s", str(scr)] + (["/readonly"] if readonly else [])
-    return subprocess.run(command, capture_output=True, timeout=timeout, cwd=str(scr.parent)).returncode
 
 
 def save_dwg(dxf: Path, dwg: Path, timeout: float) -> dict[str, Any]:

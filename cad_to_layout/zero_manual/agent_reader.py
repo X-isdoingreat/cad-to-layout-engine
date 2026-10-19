@@ -23,8 +23,8 @@ from typing import Any
 
 from . import agent_tools
 
-PROMPT_PATH = Path(__file__).with_name("agent_reader_prompt_v10.md")  # the designated building only; v10 (2026-10-10): only its view and sections are listed
-PROMPT_ID = "agent_reader_prompt_v10"
+PROMPT_PATH = Path(__file__).with_name("agent_reader_prompt_v11.md")  # v11 (2026-10-16): `trace` candidates held against the drawing's own numbers; paged lists
+PROMPT_ID = "agent_reader_prompt_v11"
 SERVICE_TIER = "fast"  # 2026-10-05: faster responses (uses the plan's allowance faster)
 AGENT_BACKEND = os.environ.get("CTLE_AGENT", "claude")  # "claude": Claude Code headless (default); "codex": Codex CLI
 CLAUDE_MODEL = os.environ.get("CTLE_CLAUDE_MODEL", "sonnet")
@@ -70,12 +70,23 @@ def run_agent(work: Path, designation: str | None, executable: str = "codex", ti
     prompt = PROMPT_PATH.read_text(encoding="utf-8").replace("{PY}", python) + "\n\n## 本次指定的建筑\n\n" + (designation or "未指定（没有给出指定）") + "\n"
     if extra:
         prompt += "\n" + extra
+    return run_prompt(work, prompt, tag=tag, timeout_seconds=timeout_seconds, executable=executable)
+
+
+def run_prompt(work: Path, prompt: str, tag: str = "", timeout_seconds: float = 3600.0, executable: str = "codex",
+               answer_key: str = "buildings", model: str | None = None) -> dict[str, Any]:
+    """One unattended agent call with the given prompt in the work directory; prompt, transcript and answer are kept.
+
+    `model` (Claude backend only) overrides CLAUDE_MODEL for this call; the model used is in the result.
+    """
+
+    work = work.resolve()
     (work / f"prompt{tag}.txt").write_text(prompt, encoding="utf-8")
     env = dict(os.environ)
     env["PYTHONPATH"] = str(PACKAGE_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     started = time.time()
     if AGENT_BACKEND == "claude":
-        return _run_claude(work, prompt, env, started, timeout_seconds, tag)
+        return _run_claude(work, prompt, env, started, timeout_seconds, tag, answer_key, model or CLAUDE_MODEL)
     command = [executable, "-a", "never", "-s", "workspace-write", "-c", "model_reasoning_effort=xhigh", "-c", f"service_tier={SERVICE_TIER}", "exec", "--skip-git-repo-check", "-o", str(work / f"answer{tag}.txt"), "-"]
     completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, cwd=str(work), env=env)
     (work / f"events{tag}.txt").write_text(completed.stdout, encoding="utf-8")
@@ -96,17 +107,19 @@ CLAUDE_SYSTEM_NOTE = ("这是一个无人值守的自动读图任务：不要向
                       "其他说明文件里关于汇报、计划、日志的要求不适用于本任务。只用提示里给的工具读图，最后一条回复只输出 JSON。")
 
 
-def _run_claude(work: Path, prompt: str, env: dict[str, str], started: float, timeout_seconds: float, tag: str) -> dict[str, Any]:
+def _run_claude(work: Path, prompt: str, env: dict[str, str], started: float, timeout_seconds: float, tag: str,
+                answer_key: str = "buildings", model: str | None = None) -> dict[str, Any]:
     """The same read with Claude Code headless (Claude Max plan); records tokens and the plan's usage before and after."""
 
-    command = ["claude", "-p", "--model", CLAUDE_MODEL, "--output-format", "stream-json", "--verbose", "--no-session-persistence",
+    model = model or CLAUDE_MODEL
+    command = ["claude", "-p", "--model", model, "--output-format", "stream-json", "--verbose", "--no-session-persistence",
                "--strict-mcp-config", "--allowedTools", "Bash", "Read", "Glob", "Grep", "--disallowedTools", "Write", "Edit", "NotebookEdit",
                "--append-system-prompt", CLAUDE_SYSTEM_NOTE]
     completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, cwd=str(work), env=env)
     (work / f"events{tag}.txt").write_text(completed.stdout, encoding="utf-8")
     (work / f"stderr{tag}.txt").write_text(completed.stderr, encoding="utf-8")
     text, usage, limits, cost, tool_calls = "", {}, [], None, 0
-    answer, earlier = None, answer_from_events(completed.stdout)
+    answer, earlier = None, answer_from_events(completed.stdout, answer_key)
     for line in completed.stdout.splitlines():
         try:
             event = json.loads(line)
@@ -125,12 +138,12 @@ def _run_claude(work: Path, prompt: str, env: dict[str, str], started: float, ti
     answer = answer if answer is not None else earlier  # the JSON was given, then followed by another message (seen 2026-10-09)
     tokens = sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")) or None
     return {"returncode": completed.returncode, "minutes": round((time.time() - started) / 60, 1), "tokens_used": tokens,
-            "tokens_detail": usage, "cost_usd_equivalent": cost, "plan_usage_seen": limits, "tool_calls": tool_calls,
+            "tokens_detail": usage, "cost_usd_equivalent": cost, "plan_usage_seen": limits, "tool_calls": tool_calls, "model": model,
             "answer": answer, "answer_from_earlier_message": from_earlier, "raw_answer": text}
 
 
-def answer_from_events(stream: str) -> dict[str, Any] | None:
-    """The last assistant message in a Claude stream-json transcript that holds the answer JSON (it has "buildings")."""
+def answer_from_events(stream: str, key: str = "buildings") -> dict[str, Any] | None:
+    """The last assistant message in a Claude stream-json transcript that holds the answer JSON (it has `key`, e.g. "buildings")."""
 
     found = None
     for line in stream.splitlines():
@@ -142,7 +155,7 @@ def answer_from_events(stream: str) -> dict[str, Any] | None:
             continue
         for c in (event.get("message") or {}).get("content", []):
             value = _json_from(c.get("text") or "") if c.get("type") == "text" else None
-            if value is not None and "buildings" in value:
+            if value is not None and key in value:
                 found = value
     return found
 
@@ -197,12 +210,49 @@ def verify(work: Path, answer: dict[str, Any]) -> list[dict[str, Any]]:
                     row["status"] = "measured_with_decided_parts"
         row["columns_check"] = _columns_check(work, b, row)
         if row.get("outline") and m and (work / agent_tools.INDEX.name).is_file():
-            # the drawing's own end-to-end dimensions against the measured outline
+            # what the drawing itself says against the measured outline: end-to-end dimensions, written area notes;
+            # and the outline's own shape: shallow notches an automatic trace cuts where the outer wall has an opening
             idx = agent_tools.Index(work / agent_tools.INDEX.name)
             row["dimension_check"] = agent_tools.dimension_check(row["outline"], float(m), idx)
+            measured = float((row.get("with_decided_parts") or row.get("remeasured") or {}).get("area_m2") or 0)
+            row["stated_area_check"] = agent_tools.stated_area_check(row["outline"], measured, float(m), idx)
+            row["notch_check"] = agent_tools.notch_check(row["outline"], float(m))
+            row["drawing_says"] = drawing_says(row, float(m))
             idx.con.close()
         checks.append(row)
     return checks
+
+
+def _dimension_directions(rows: list[dict[str, Any]], outline: list[list[float]], m: float) -> list[dict[str, Any]]:
+    """End-to-end dimensions grouped by direction (along the outline's length or its width), distinct values each."""
+
+    from shapely.geometry import Polygon
+
+    rect = Polygon(outline).minimum_rotated_rectangle
+    corners = list(rect.exterior.coords) if rect.geom_type == "Polygon" else []
+    if len(corners) < 3:
+        return []
+    sides = sorted((math.dist(corners[i], corners[i + 1]) * m for i in range(2)), reverse=True)
+    groups: dict[str, dict[str, Any]] = {}
+    for d in rows:
+        # the outline extent in the dimension's direction says which side it measures
+        along = "长" if abs(d["outline_extent_m"] - sides[0]) <= abs(d["outline_extent_m"] - sides[1]) else "宽"
+        g = groups.setdefault(along, {"side": along, "outline_extent_m": d["outline_extent_m"], "dimensions_m": [], "flagged": False, "at": d.get("at")})
+        if d["dimension_m"] not in g["dimensions_m"]:
+            g["dimensions_m"].append(d["dimension_m"])
+        g["flagged"] = g["flagged"] or bool(d.get("flagged"))
+    for g in groups.values():
+        g["dimensions_m"].sort()
+    return [groups[k] for k in ("长", "宽") if k in groups]
+
+
+def drawing_says(row: dict[str, Any], m: float) -> dict[str, Any]:
+    """What the drawing itself states about this building, beside the measured numbers: total dimensions and area notes."""
+
+    dims = _dimension_directions(row.get("dimension_check") or [], row["outline"], m)
+    areas = [{"text": s["text"], "value_m2": s["value_m2"], "differs_pct": s["differs_pct"], "flagged": s["flagged"]}
+             for s in (row.get("stated_area_check") or {}).get("compared", [])]
+    return {"dimensions": dims, "areas": areas}
 
 
 def verify_zones(work: Path, answer: dict[str, Any]) -> dict[str, Any]:
@@ -241,6 +291,7 @@ NO_BUILDING_IMPACT_M2 = 100000  # giving up on every building is worse than any 
 OUTSIDE_EDGE_MIN_COLUMNS = 5  # this many of the building's own columns just outside its outline: the outline is on an inner line
 OUTSIDE_EDGE_MIN_SHARE = 0.1  # ... and at least this share of the building's columns
 MAX_REVISIONS = 3  # rounds of sending the program's findings back
+ADJUDICATE = True  # after the kept answer: discrepancies with the drawing's own numbers go to the adjudicator (adjudicator.py)
 TRIAL_SCOPE = True  # 2026-10-07: read only the designated building and the named zones; other buildings and columns are out
 GRID_REACH_M = 2.0  # outer walls stand on (or within this of) the outermost column line
 REVISION_HEADER = """## 程序核对发现的问题（请修正）
@@ -319,12 +370,30 @@ def findings(work: Path, answer: dict[str, Any], checks: list[dict[str, Any]]) -
         reported_columns = ((by_name.get(name) or {}).get("columns") or {}).get("count")
         if not TRIAL_SCOPE and (c.get("columns_check") or {}).get("status") == "no_tool_count" and (c.get("designated") or reported_columns):
             add("bookkeeping", name, f"建筑「{name}」：没有用这栋楼最终的面运行 column_instances。", 0.0, centre)
-        for d in c.get("dimension_check") or []:
-            if abs(d["differs_pct"]) > 1.0:
-                size = float((c.get("with_decided_parts") or c.get("remeasured") or {}).get("area_m2") or 0)
-                impact = abs(d["differs_pct"]) / 100 * size
-                add("dimension", name, f"建筑「{name}」：图上端到端尺寸标注 {d['dimension_m']} m，与轮廓同方向的长度 {d['outline_extent_m']} m 相差 {d['differs_pct']}%"
-                                       f"（影响约 {impact:.0f} m²）。", impact, centre)
+        size = float((c.get("with_decided_parts") or c.get("remeasured") or {}).get("area_m2") or 0)
+        dims = (c.get("drawing_says") or {}).get("dimensions")
+        if dims is None and c.get("outline") and m:  # a check made before drawing_says existed
+            dims = _dimension_directions(c.get("dimension_check") or [], c["outline"], m)
+        for g in dims or []:  # one mark per side, whatever number of dimensions measure it (a total is often drawn twice)
+            if g["flagged"]:
+                worst = max(g["dimensions_m"], key=lambda v: abs(g["outline_extent_m"] - v))
+                pct = 100 * (g["outline_extent_m"] - worst) / worst
+                impact = abs(pct) / 100 * size
+                # either side may be the wrong one: an outline traced short, or a dimension that measures more than the building
+                why = ("轮廓可能漏了一段，也可能这个尺寸量的不只是这栋楼（如含坡道、雨篷的外廓）" if worst > g["outline_extent_m"]
+                       else "轮廓可能多圈进了东西，也可能这个尺寸量的是轴线而外墙在轴线之外")
+                add("dimension", name, f"建筑「{name}」：图上{g['side']}向的端到端总尺寸标注 {' / '.join(f'{v:g}' for v in g['dimensions_m'])} m，"
+                                       f"轮廓同方向的长度 {g['outline_extent_m']} m，相差 {pct:.1f}%；{why}（影响约 {impact:.0f} m²）。", impact, centre)
+        for s in (c.get("stated_area_check") or {}).get("compared", []):
+            if s.get("flagged"):
+                impact = abs(s["measured_m2"] - s["value_m2"])
+                add("stated_area", name, f"建筑「{name}」：图上写着「{s['text']}」（{s['value_m2']:,.2f} m²），程序按轮廓量出 {s['measured_m2']:,.2f} m²，"
+                                         f"相差 {s['differs_pct']}%（影响约 {impact:.0f} m²）。", impact, centre)
+        nc = c.get("notch_check") or {}
+        if nc.get("flagged"):
+            add("notches", name, f"建筑「{name}」：轮廓有 {nc['notches']} 处向楼内的浅凹口，合计约 {nc['filled_m2']:.0f} m²（占 {100 * nc['share']:.1f}%）。"
+                                 f"自动描边在外墙有缺口处会走进楼内；这些凹口是真的凹进去，还是外墙其实是连续的？", nc["filled_m2"], centre,
+                {"polygons": nc["polygons"]})
         if c.get("unchecked_neighbours"):
             add("bookkeeping", name, f"建筑「{name}」：相邻面 {', '.join(c['unchecked_neighbours'][:12])} 没有写进 neighbour_decisions。", 0.0, centre)
         if not c.get("outline") or not m:
@@ -518,6 +587,10 @@ def read_once(work: Path, designation: str | None, info: dict[str, Any] | None =
             checks = verify(work, answer)
     result.update({"answer": answer, "checks": checks, "zone_check": verify_zones(work, answer) if answer else {},
                    "remaining_feedback": feedback(work, answer, checks) if answer else []})
+    if ADJUDICATE and answer:  # 2026-10-16: the program's discrepancies go to a second, narrowly scoped agent call
+        from . import adjudicator
+
+        result = adjudicator.adjudicate_read(work, result)
     return result
 
 
@@ -529,4 +602,4 @@ def read_with_agent(dxf: Path, work: Path, designation: str | None) -> dict[str,
     return result
 
 
-__all__ = ["feedback", "findings", "prepare", "read_once", "read_with_agent", "run_agent", "verify", "verify_zones"]
+__all__ = ["feedback", "findings", "prepare", "read_once", "read_with_agent", "run_agent", "run_prompt", "verify", "verify_zones"]

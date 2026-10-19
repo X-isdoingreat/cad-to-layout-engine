@@ -317,6 +317,7 @@ def apply(args: argparse.Namespace) -> int:
         records = [r for r in equipment["records"] if r["family"] == it["family"] and r["view_id"] not in copies] if it["type"] != "UNRECOGNISED" else []
         count = len(records) if records else it["count"]  # an unrecognised kind has no records: its occurrences are the count
         rows.append({"id": it["id"], "type": kind, "type_zh": LABEL_ZH.get(kind, kind), "name": name, "count": count, "size_mm": it["size_mm"], "source": source})
+    rows += repeat_rows(run, decisions)
     totals = Counter()
     for r in rows:
         totals[(r["type_zh"], r["name"])] += r["count"]
@@ -350,11 +351,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--table", required=True)
     p.add_argument("--reviewer")
     p.add_argument("--minutes", type=float)
+    p = sub.add_parser("repeat")
+    p.add_argument("--run", required=True)
     p = sub.add_parser("dwg")
     p.add_argument("--run", required=True)
     p.add_argument("--area", help="trial_package out dir: the building outline is drawn too")
     p.add_argument("--timeout", type=float, default=1800.0)
     args = parser.parse_args(argv)
+    if args.cmd == "repeat":
+        result = repeats(Path(args.run).resolve())
+        print(json.dumps([(g["id"], len(g["places"]), (g.get("suggestion") or {}).get("type")) for v in result["views"] for g in v["groups"]], ensure_ascii=False))
+        return 0
     return {"make": make, "apply": apply}.get(args.cmd, lambda a: review_dwg(a))(args)
 
 
@@ -532,6 +539,7 @@ def review_dwg(args: argparse.Namespace) -> int:
                              "text": f"厂房：{b['area_m2']:,.0f} m²，{b.get('length_m', 0):.1f} × {b.get('width_m', 0):.1f} m（系统识别，待核对）", "height": 2000.0,
                              "record": {"building": b["name"]}})
     layers = {**{layer_of[t]: aci for t, aci in TYPE_ACI.items()}, "CTLE_设备编号": 7, "CTLE_请确认": 2, "CTLE_厂房轮廓": 1}
+    entities += _repeat_entities(run, layers)
     dxf = review / "核对用.dxf"
     write_result_dxf(run / "convert/source.dxf", entities, dxf, extra_layers=layers)
     out = review / "check.dwg"  # ASCII: AutoCAD scripts do not take this path otherwise
@@ -540,6 +548,226 @@ def review_dwg(args: argparse.Namespace) -> int:
     dxf.unlink(missing_ok=True)
     print(json.dumps({"dwg": str(out), "saved": saved, "entities": len(entities), "questions": sorted(asked)}, ensure_ascii=False))
     return 0
+
+
+def _repeat_entities(run: Path, layers: dict[str, int]) -> list[dict[str, Any]]:
+    """The R groups the review PDF shows (only when the report already counted them; nothing is counted here): each
+    group's places on its own layer CTLE_重复图形_R#, the example outlined thick, and the R number with its question."""
+
+    path = run / "review" / "repeat" / "repeat.json"
+    if not path.is_file():
+        return []
+    out = []
+    for view in json.loads(path.read_text(encoding="utf-8"))["views"]:
+        groups = view["groups"]
+        s = groups[0].get("suggestion") or {}
+        kind = s.get("type")
+        guess = "无法判断" if kind in (None, "UNSURE") else ((s.get("name") or LABEL_ZH.get(kind, kind)) if kind == "OTHER_EQUIPMENT" else LABEL_ZH.get(kind, kind))
+        for n, g in enumerate(groups):
+            layer = f"CTLE_重复图形_{g['id']}"
+            layers[layer] = REPEAT_ACI[n % len(REPEAT_ACI)]
+            for c in g["places"]:
+                out.append({"layer": layer, "kind": "outline", "points": [[c[0], c[1]], [c[2], c[1]], [c[2], c[3]], [c[0], c[3]]], "record": {"repeat": g["id"]}})
+            e = g["example"]
+            size = max(e[2] - e[0], e[3] - e[1])
+            out.append({"layer": layer, "kind": "outline", "points": [[e[0], e[1]], [e[2], e[1]], [e[2], e[3]], [e[0], e[3]]],
+                        "width": min(max(size * 0.03, 30.0), 120.0), "record": {"repeat": g["id"], "example": True}})
+            if n == 0 and kind == "NOT_EQUIPMENT":
+                text = f"{g['id']}：{len(g['places']):,} 处重复图形，系统认为不是设备（未计入），请看一眼"
+            elif n == 0:
+                text = f"{g['id']}：系统识别为 {guess}，{len(g['places']):,} 处，是否正确？每处算几格？"
+            elif kind == "NOT_EQUIPMENT":
+                text = f"{g['id']}：另有 {len(g['places']):,} 处相似图形（未计入）"
+            else:
+                text = f"{g['id']}：另有 {len(g['places']):,} 处相似图形，也是{guess}吗？（未计入）"
+            out.append({"layer": layer, "kind": "text", "at": [(e[0] + e[2]) / 2, e[3] + max(size * 0.3, 600.0)], "text": text,
+                        "height": min(max(size / 4, 500.0), 1500.0), "record": {"repeat": g["id"]}})
+    return out
+
+
+# ---------------------------------------------------------------- counting by repetition (equipment drawn as loose lines or parts)
+REPEAT_COLOURS = ["#dc2626", "#f59e0b", "#7c3aed", "#0d9488"]
+REPEAT_ACI = [1, 30, 6, 4]  # the same red / orange / purple / cyan in the review drawing
+
+
+REPEAT_GUIDANCE = """你在看一张仓储物流 CAD 平面图。左图是一个重复单元：同样的图形在这张平面图上重复出现很多次，排成阵列；右图是它在原图里的一处位置（红框）和周围的原图线条。
+请判断这一整片重复排列的东西是什么设备（不是问单元里的某个零件），只能从下面选一个：
+RACK 货架（俯视的货架格、成排货架）
+STACKER 堆垛机（含堆垛机轨道、巷道）
+PALLET_CONV_CHAIN 托盘链条输送机
+PALLET_CONV_ROLLER 托盘滚筒输送机
+CONVEYOR_UNKNOWN_SUBTYPE 输送机但看不出子类
+BOX_CONVEYOR 箱式输送机（窄的料箱输送线）
+BOX_LIFT 提升机
+ROBOT_ARM 机械臂
+OTHER_EQUIPMENT 其他物流设备（在 name 写名称）
+NOT_EQUIPMENT 不是设备（柱网、墙、门窗、楼梯、表格、图框、标注、地面标记）
+UNSURE 实在看不出
+不要用工具，只看图和文字。只输出 JSON：{"type": "...", "name": "...", "reason": "一句话"}"""
+
+
+def _record_box(r: dict[str, Any]) -> list[float]:
+    half = max(r["length_mm"], r["width_mm"]) / 2
+    return [r["centre"][0] - half, r["centre"][1] - half, r["centre"][0] + half, r["centre"][1] + half]
+
+
+def repeats(run: Path, index: Any = None) -> dict[str, Any]:
+    """Groups of repeated linework on every counted plan (`repeat_count.count_view`), each group numbered R1, R2...
+    The first group of a plan is the program's own example, the AI names it (3 asks, a suggestion only); later groups
+    are questions.  A plan whose first group mostly lies on equipment already counted from blocks gets no group, so
+    nothing is counted twice.  Saved in review/repeat/repeat.json and reused."""
+
+    from cad_to_layout.zero_manual.constants import REPEAT_ALREADY_COUNTED_SHARE
+    from cad_to_layout.zero_manual.repeat_count import count_view
+
+    folder = run / "review" / "repeat"
+    path = folder / "repeat.json"
+    if path.is_file():
+        out = json.loads(path.read_text(encoding="utf-8"))
+        # a name the AI never answered (network down, every ask failed) is asked again; the counts are kept
+        failed = [v for v in out["views"] if not any(a.get("type") for a in (v["groups"][0].get("suggestion") or {}).get("asks", []))
+                  or (v["groups"][0].get("suggestion") or {}).get("guidance") != _guidance_sha()]  # or asked with other words
+        if failed:
+            _, _, inventory = _load(run)
+            own_index = index is None
+            index = index or _index(run, run / "review")
+            for view in failed:
+                view["groups"][0]["suggestion"] = _repeat_suggestion(folder, view["groups"][0], index, inventory)
+            if own_index:
+                index.con.close()
+            path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        return out
+    folder.mkdir(parents=True, exist_ok=True)
+    equipment, views, inventory = _load(run)
+    skipped = not_counted(equipment, views)
+    own_index = index is None
+    index = index or _index(run, run / "review")
+    out: dict[str, Any] = {"views": [], "skipped_already_counted": []}
+    number = 0
+    for view_id, v in views.items():
+        if view_id in skipped or not v.get("window"):
+            continue
+        result = count_view(index, v["window"])
+        if not result["groups"]:
+            continue
+        boxes = [_record_box(r) for r in equipment["records"] if r["view_id"] == view_id]
+        first = result["groups"][0]["places"]
+        on_counted = sum(1 for c in first if any(b[0] <= (c[0] + c[2]) / 2 <= b[2] and b[1] <= (c[1] + c[3]) / 2 <= b[3] for b in boxes))
+        if on_counted >= REPEAT_ALREADY_COUNTED_SHARE * len(first):
+            out["skipped_already_counted"].append({"view_id": view_id, "places": len(first), "on_counted_equipment": on_counted})
+            continue
+        for g in result["groups"]:
+            number += 1
+            g["id"] = f"R{number}"
+        out["views"].append({"view_id": view_id, "seconds": result["seconds"], "groups": result["groups"]})
+    for view in out["views"]:
+        view["groups"][0]["suggestion"] = _repeat_suggestion(folder, view["groups"][0], index, inventory)
+    if own_index:
+        index.con.close()
+    path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    return out
+
+
+def _repeat_suggestion(folder: Path, group: dict[str, Any], index: Any, inventory: dict[str, Any]) -> dict[str, Any]:
+    """The AI's guess for what the program's example is: the example alone and in its surroundings, asked 3 times."""
+
+    from matplotlib import patches
+
+    from cad_to_layout.zero_manual.agent_reader import _json_from
+    from cad_to_layout.zero_manual.constants import SPLIT_JUDGE_MAJORITY, SPLIT_JUDGE_REPEATS
+    from cad_to_layout.zero_manual.llm_judge import external_transport
+
+    pyplot = _matplotlib()
+    b = group["example"]
+    half = 3.0 * max(b[2] - b[0], b[3] - b[1])
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    window = [cx - half, cy - half, cx + half, cy + half]
+    figure, (left, right) = pyplot.subplots(1, 2, figsize=(10, 5))
+    for axis, win in ((left, b), (right, window)):
+        for ln in index.select(win, limit=40000):
+            p = ln["p"]
+            if axis is left and not all(b[0] <= x <= b[2] and b[1] <= y <= b[3] for x, y in p):
+                continue
+            axis.plot([q[0] for q in p], [q[1] for q in p], color="#111827" if axis is left else "#374151", linewidth=0.6 if axis is left else 0.3)
+        axis.set_xlim(win[0], win[2])
+        axis.set_ylim(win[1], win[3])
+        axis.set_aspect("equal")
+        axis.axis("off")
+    right.add_patch(patches.Rectangle((b[0], b[1]), b[2] - b[0], b[3] - b[1], edgecolor="#dc2626", facecolor="none", linewidth=2))
+    image = folder / f"{group['id']}.png"
+    figure.savefig(image, facecolor="white", dpi=110)
+    pyplot.close(figure)
+    near = sorted({" ".join(t["text"].split())[:20] for t in inventory["texts"] if window[0] <= t["xy"][0] <= window[2] and window[1] <= t["xy"][1] <= window[3]})[:8]
+    size = [round(b[2] - b[0]), round(b[3] - b[1])]
+    prompt = REPEAT_GUIDANCE + f"\n\n单元尺寸：{size[0]} × {size[1]} mm；同样的图形在这张平面图上重复出现 {len(group['places'])} 次；附近文字：{'；'.join(near) or '无'}"
+    transport = external_transport()
+    asks = []
+    for n in range(1, SPLIT_JUDGE_REPEATS + 1):
+        call = folder / f"{group['id']}_ask{n}"
+        call.mkdir(exist_ok=True)
+        raw = transport(prompt, image, call)
+        value = _json_from(raw.get("text", "")) or {}
+        asks.append({"type": value.get("type"), "name": str(value.get("name") or "")[:30], "reason": str(value.get("reason") or "")[:120]})
+    votes = Counter(a["type"] for a in asks if a.get("type"))
+    if not votes:
+        return {"type": "UNSURE", "name": "", "votes": f"0/{len(asks)}", "asks": asks, "guidance": _guidance_sha()}
+    top, n = votes.most_common(1)[0]
+    return {"type": top if n >= SPLIT_JUDGE_MAJORITY else "UNSURE", "name": next((a["name"] for a in asks if a["type"] == top and a["name"]), ""),
+            "votes": f"{n}/{len(asks)}", "asks": asks, "guidance": _guidance_sha()}
+
+
+def _guidance_sha() -> str:
+    import hashlib
+
+    return hashlib.sha256(REPEAT_GUIDANCE.encode("utf-8")).hexdigest()[:12]
+
+
+def per_place(decision: str) -> tuple[str, int | None]:
+    """'对，每处2格' -> ('对', 2); '货架 ×2' -> ('货架', 2); '是' -> ('是', None).  A place found by repetition can hold more
+    than one unit (the example can straddle two back-to-back rows); the person, who sees the example, says how many."""
+
+    import re
+
+    m = re.search(r"(?:每处|每个红框|每个|每框|×|x|X|\*)\s*(\d+)\s*(?:格|台|段|个|处)?", decision)
+    if not m:
+        return decision.strip(), None
+    return (decision[:m.start()] + decision[m.end():]).strip(" ，,；;、"), int(m.group(1))
+
+
+def repeat_rows(run: Path, decisions: dict[str, str]) -> list[dict[str, Any]]:
+    """Counted groups after the reply: on a plan's first group 对 = the suggestion, a type name = that type, 不是 =
+    dropped; a later group counts (as its plan's first group) only on 是 / 对; unanswered later groups are not counted.
+    Units per place: as the person says (每处 N 格), a later group taking its first group's number unless it says its
+    own; 1 when nobody said (and the source says so)."""
+
+    path = run / "review" / "repeat" / "repeat.json"
+    if not path.is_file():
+        return []
+    rows = []
+    for view in json.loads(path.read_text(encoding="utf-8"))["views"]:
+        first = view["groups"][0]
+        s = first.get("suggestion") or {}
+        d, per = per_place(decisions.get(first["id"], ""))
+        if d.startswith("是") and d[1:] in ZH_TO_TYPE:  # "是货架"
+            d = d[1:]
+        if d in {"不是", "不是设备"} or (s.get("type") == "NOT_EQUIPMENT" and d in {"", "对", "是"}):
+            continue  # the AI's "not equipment" counts only when the person names the equipment
+        if d in {"", "对", "是"}:
+            kind, name = s.get("type", "UNSURE"), s.get("name", "")
+            source = "已人工核对" if d or per else "系统识别（未核对）"
+        else:
+            kind, name, source = ZH_TO_TYPE.get(d, "OTHER_EQUIPMENT"), ("" if d in ZH_TO_TYPE else d), "人工修正"
+        b = first["example"]
+        note = "（重复图形计数" + ("，每处按 1 计、未确认）" if per is None else f"，每处 {per}）")
+        rows.append({"id": first["id"], "type": kind, "type_zh": LABEL_ZH.get(kind, kind), "name": name, "count": len(first["places"]) * (per or 1),
+                     "per_place": per or 1, "size_mm": [round(b[2] - b[0]), round(b[3] - b[1])], "source": source + note})
+        for g in view["groups"][1:]:
+            answer, own = per_place(decisions.get(g["id"], ""))
+            if answer in {"是", "对"}:
+                n = own or per or 1
+                rows.append({**rows[-1], "id": g["id"], "count": len(g["places"]) * n, "per_place": n,
+                             "source": f"人工确认（重复图形计数，每处 {n}）"})
+    return rows
 
 
 if __name__ == "__main__":
