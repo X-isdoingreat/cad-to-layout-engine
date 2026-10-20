@@ -11,13 +11,17 @@ Run `py -3.11 -X utf8 -m cad_to_layout.cad_runtime doctor`. If it is not `"statu
 (usually: create `cad_runtime.json` with their AutoCAD path or `{"backend": "oda"}`, or install ODA File Converter).
 Never pick an AutoCAD version for them; ask which installation to use if several are listed.
 
+The AI that reads the drawing inside the command is chosen by the environment variable `CTLE_AGENT`:
+`claude` (default; needs Claude Code logged in) or `codex` (needs Codex CLI logged in). See README "需要什么" for
+what each has been verified to do.
+
 ## 1. What to read
 
 You need: the DWG path, and which building to measure (its name as written on the drawing, or a position such as
 "图纸坐标 (x, y) 处的那栋"). If the user did not say which building and wants the size, ask; never choose one.
 Equipment only → `--no-area`. Building only → `--no-equipment`.
 
-Tell the user once that the drawing content is sent to the AI service (Anthropic by default) and that they should have
+Tell the user once that the drawing content is sent to the AI service chosen above and that they should have
 the owner's consent.
 
 ## 2. Run

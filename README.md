@@ -23,7 +23,11 @@ one sentence.
 - Python 3.11+：`pip install -r requirements.txt`
 - [ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter)（免费，必需）：读设备时把 DWG 转成 DXF。装好后能自动找到；找不到时设环境变量 `ODA_FILE_CONVERTER` 指向 `ODAFileConverter.exe`。
 - AutoCAD（可选，任意 2013 及以后版本）：用它转换和截图更稳；没有 AutoCAD 时用 ODA + 程序自绘图片。
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)（必需）：读图、定夺和判断设备类型时调用 `claude -p`，使用你自己的账号。**图纸内容会发送到 Anthropic 的服务，请先征得图纸所有者同意。** 一张图读一遍约 40 万～150 万 token，账号套餐要够量。（代码里留有 `CTLE_AGENT=codex` 切到 Codex CLI 的开关，但当前提示词只在 Claude 上调过，Codex 这条路未验证。）
+- 一个 AI 命令行工具（必需，二选一），读图、定夺和判断设备类型时由程序调用，用你自己的账号；用环境变量 `CTLE_AGENT` 选：
+  - `claude`（默认）：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)，调用 `claude -p`。厂房尺寸、定夺、设备判断都在它上面验证过。一张图读一遍约 40 万～150 万 token，账号套餐要够量。
+  - `codex`：[Codex CLI](https://github.com/openai/codex)，调用 `codex exec`。厂房尺寸读图验证过一张（与 Claude 的结果差 0.01%，图上尺寸对上，复查包齐全；Codex 报约 10 万 token）；定夺和设备判断在它上面还没跑过。
+
+  **图纸内容会发送到所选 AI 服务（Anthropic 或 OpenAI），请先征得图纸所有者同意。**
 - 中文字体：报告和 DWG 标签用微软雅黑（中文 Windows 自带）；没有这个字体的机器上中文会显示成方块，程序不会报错。
 
 ## 安装（每台电脑一次）
@@ -69,9 +73,9 @@ py -3.11 -X utf8 -m scripts.read_drawing --dwg "<图纸.dwg>" --building "<楼�
 
 复查人看完用一句话回复即可，例如："面积正确。E53 正确，E63 是货架，其余正确；左下角一排输送机未识别。" 处理回复的步骤见 [docs/REVIEW_REPLY.md](docs/REVIEW_REPLY.md)。
 
-## 用 Claude Code 操作
+## 用 Claude Code 或 Codex 操作
 
-仓库里带了一个 skill（`.claude/skills/read-drawing/SKILL.md`）。在仓库目录打开 Claude Code，说：
+仓库里带了操作说明：Claude Code 读 `.claude/skills/read-drawing/SKILL.md`，Codex 等其他 agent 读 `AGENTS.md`（内容相同）。在仓库目录打开其中一个，说：
 
 > 读一下这张图 C:\...\某厂房.dwg，要改造的是"1号厂房"。
 

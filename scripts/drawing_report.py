@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -27,6 +28,8 @@ sys.path.insert(0, str(ROOT))
 from cad_to_layout.zero_manual.equipment import LABEL_ZH  # noqa: E402
 from scripts.equipment_review import COLOURS, WAREHOUSE_TYPES, _block_of, _index, _load, _matplotlib, _tile, items_of, not_counted  # noqa: E402
 from scripts.trial_package import wrap_keep  # noqa: E402
+
+AI_SERVICE = "OpenAI" if os.environ.get("CTLE_AGENT", "claude").lower() == "codex" else "Anthropic"  # named in the report footer
 
 PAGE = (11.69, 8.27)
 UNIT = {"RACK": "格", "PALLET_CONV_CHAIN": "段", "PALLET_CONV_ROLLER": "段", "CONVEYOR_UNKNOWN_SUBTYPE": "段", "BOX_CONVEYOR": "段"}
@@ -455,7 +458,7 @@ def conclusion(pyplot: Any, drawing: str, area: dict[str, Any] | None, equipment
         for k, piece in enumerate(wrap_keep(text, width)):
             figure.text(0.18, y - k * step, piece, fontsize=size)
         y -= step * max(1, len(wrap_keep(text, width))) + 0.025
-    figure.text(0.06, 0.06, "识别时图纸内容会发送至 Anthropic 的 AI 服务处理，请事先征得图纸所有者同意。设备样式明细见同名附录文件；需要放大核对时，请打开同名的核对用 DWG。", fontsize=10, color="#4b5563")
+    figure.text(0.06, 0.06, f"识别时图纸内容会发送至 {AI_SERVICE} 的 AI 服务处理，请事先征得图纸所有者同意。设备样式明细见同名附录文件；需要放大核对时，请打开同名的核对用 DWG。", fontsize=10, color="#4b5563")
     return figure
 
 
