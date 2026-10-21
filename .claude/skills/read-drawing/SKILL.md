@@ -10,6 +10,7 @@ description: Read a CAD drawing (DWG) for the size of a named building and its w
 Run `py -3.11 -X utf8 -m cad_to_layout.cad_runtime doctor`. If it is not `"status": "pass"`, show the user the message
 (usually: create `cad_runtime.json` with their AutoCAD path or `{"backend": "oda"}`, or install ODA File Converter).
 Never pick an AutoCAD version for them; ask which installation to use if several are listed.
+If the user says which CAD they have ("我们用的是 AutoCAD 2024", "没有 AutoCAD"), follow the `setup-cad` skill first.
 
 The AI that reads the drawing inside the command is chosen by the environment variable `CTLE_AGENT`:
 `claude` (default; needs Claude Code logged in) or `codex` (needs Codex CLI logged in). See README "需要什么" for
