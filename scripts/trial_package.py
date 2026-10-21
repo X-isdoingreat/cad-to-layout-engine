@@ -1,7 +1,7 @@
 """Review package: one command per drawing.
 
   run:     py -3.11 -X utf8 -m scripts.trial_package run --dwg <customer.dwg> [--designation "厂房名或 坐标 x, y"] --out <dir> [--reads 2]
-           copy of the customer DWG -> DXF (AutoCAD 2025) -> the agent reads it N times (Claude, in parallel) ->
+           copy of the customer DWG -> DXF (AutoCAD 2025) -> the agent reads it N times (Claude or Codex, by CTLE_AGENT) ->
            <out>/发给复查人员/ : 结果（待复查）.pdf (the machine's result first, with the few unsure places), to_confirm.dwg,
            复查清单.md, 复查说明.pdf
   finish:  py -3.11 -X utf8 -m scripts.trial_package finish --out <dir> [--returned-dwg <saved DWG>] [--passed] --confirmer NAME --minutes N

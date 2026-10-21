@@ -27,6 +27,14 @@ class Transport(Protocol):
     def __call__(self, prompt: str, image: Path, work_dir: Path) -> dict[str, Any]: ...
 
 
+def run_cli(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    """The reading agent's runner: a hung CLI becomes a failed call (returncode -1) and the judge records it as invalid."""
+
+    from .agent_reader import run_cli as _run
+
+    return _run(command, **kwargs)
+
+
 def codex_exec_transport(executable: str = "codex", timeout_seconds: float = 600.0) -> Transport:
     """External transport: ``codex exec`` with the image attached, prompt on stdin, no tools."""
 
@@ -36,26 +44,22 @@ def codex_exec_transport(executable: str = "codex", timeout_seconds: float = 600
         answer = work_dir / "answer.txt"
         command = [executable, "-a", "never", "-s", "read-only", "exec", "--skip-git-repo-check",
                    "-o", str(answer), "-i", str(image), "-"]  # "-" = prompt from stdin
-        completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8",
-                                   timeout=timeout_seconds, cwd=str(work_dir))
+        completed = run_cli(command, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                            timeout=timeout_seconds, cwd=str(work_dir))
         (work_dir / "events.jsonl").write_text(completed.stdout, encoding="utf-8")
         (work_dir / "stderr.txt").write_text(completed.stderr, encoding="utf-8")
         text = answer.read_text(encoding="utf-8") if answer.is_file() else ""
-        model = None
-        for line in completed.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict) and event.get("model"):
-                model = str(event["model"])
-        tokens = None
+        model, tokens, error = None, None, None
         lines = completed.stderr.splitlines()
-        for i, line in enumerate(lines):  # the CLI prints "tokens used" followed by the count
-            if line.strip().lower() == "tokens used" and i + 1 < len(lines):
+        for i, line in enumerate(lines):
+            if line.strip().lower() == "tokens used" and i + 1 < len(lines):  # the CLI prints "tokens used" then the count
                 digits = lines[i + 1].strip().replace(",", "")
                 tokens = int(digits) if digits.isdigit() else None
-        return {"text": text, "returncode": completed.returncode, "provider": "openai-codex-cli", "model": model or "unknown", "tokens_used": tokens}
+            elif line.startswith("model:") and model is None:  # the header of the transcript
+                model = line.split(":", 1)[1].strip() or None
+            elif line.startswith("ERROR") or line.startswith("[timeout"):  # e.g. the plan's usage limit (seen 2026-10-20)
+                error = line.strip()
+        return {"text": text, "returncode": completed.returncode, "provider": "openai-codex-cli", "model": model or "unknown", "tokens_used": tokens, "error": error}
 
     return call
 
@@ -69,8 +73,8 @@ def claude_exec_transport(executable: str = "claude", model: str = "sonnet", tim
         full = f"先用 Read 工具打开这张图片再回答：{image}\n\n{prompt}"
         command = [executable, "-p", "--model", model, "--output-format", "json", "--no-session-persistence", "--strict-mcp-config",
                    "--allowedTools", "Read", "--disallowedTools", "Bash", "Write", "Edit", "NotebookEdit"]
-        completed = subprocess.run(command, input=full, capture_output=True, text=True, encoding="utf-8",
-                                   timeout=timeout_seconds, cwd=str(image.parent))
+        completed = run_cli(command, input=full, capture_output=True, text=True, encoding="utf-8",
+                            timeout=timeout_seconds, cwd=str(image.parent))
         (work_dir / "events.jsonl").write_text(completed.stdout, encoding="utf-8")
         (work_dir / "stderr.txt").write_text(completed.stderr, encoding="utf-8")
         try:
@@ -81,17 +85,20 @@ def claude_exec_transport(executable: str = "claude", model: str = "sonnet", tim
         tokens = sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")) or None
         text = str(event.get("result") or "")
         (work_dir / "answer.txt").write_text(text, encoding="utf-8")
-        return {"text": text, "returncode": completed.returncode, "provider": "anthropic-claude-code", "model": model, "tokens_used": tokens}
+        error = text if event.get("is_error") else None  # Claude Code reports failures (e.g. the plan's limit) as an error result
+        if error is None and completed.returncode != 0:
+            error = next((ln.strip() for ln in reversed(completed.stderr.splitlines()) if ln.strip()), f"exit {completed.returncode}")
+        return {"text": "" if error else text, "returncode": completed.returncode, "provider": "anthropic-claude-code", "model": model, "tokens_used": tokens, "error": error}
 
     return call
 
 
 def external_transport() -> Transport:
-    """The judge chosen by CTLE_AGENT (claude | codex; claude by default, as for the reading agent)."""
+    """The judge chosen by the same switch as the reading agent (`agent_reader.AGENT_BACKEND`: claude by default | codex)."""
 
-    import os
+    from .agent_reader import AGENT_BACKEND
 
-    return claude_exec_transport() if os.environ.get("CTLE_AGENT", "claude").lower() == "claude" else codex_exec_transport()
+    return codex_exec_transport() if AGENT_BACKEND == "codex" else claude_exec_transport()
 
 
 @dataclass
@@ -127,7 +134,7 @@ def judge_split(*, image: Path, work_dir: Path, transport: Transport | None, all
         raw = transport(prompt, image, call_dir)
         parsed = parse_answer(raw.get("text", ""))
         answers.append(parsed)
-        base["calls"].append({"index": index, "provider": raw.get("provider"), "model": raw.get("model"),
+        base["calls"].append({"index": index, "provider": raw.get("provider"), "model": raw.get("model"), "error": raw.get("error"),
                               "returncode": raw.get("returncode"), "raw_text_sha256": hashlib.sha256(str(raw.get("text", "")).encode("utf-8")).hexdigest(),
                               "parsed": parsed})
     status, adopted, size = _tally(answers, equivalence)

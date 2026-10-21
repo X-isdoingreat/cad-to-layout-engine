@@ -421,7 +421,7 @@ def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[
                 raw = transport(prompt, image, call_dir)
                 parsed = parse_tiles(raw.get("text", ""))
                 asks.append({"ask": ask_index, "image_sha256": image_sha, "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-                             "provider": raw.get("provider"), "model": raw.get("model"), "raw_text": raw.get("text", ""), "parsed": parsed})
+                             "provider": raw.get("provider"), "model": raw.get("model"), "error": raw.get("error"), "raw_text": raw.get("text", ""), "parsed": parsed})
                 for tid, row in (parsed or {}).items():
                     votes[tid].append(row["type"])
             saved[key] = {"tiles": [[tid, fam["family"]] for tid, fam in tiles], "asks": asks, "guidance_id": GUIDANCE_ID,

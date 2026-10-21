@@ -26,7 +26,7 @@ from . import agent_tools
 PROMPT_PATH = Path(__file__).with_name("agent_reader_prompt_v11.md")  # v11 (2026-10-16): `trace` candidates held against the drawing's own numbers; paged lists
 PROMPT_ID = "agent_reader_prompt_v11"
 SERVICE_TIER = "fast"  # 2026-10-05: faster responses (uses the plan's allowance faster)
-AGENT_BACKEND = os.environ.get("CTLE_AGENT", "claude")  # "claude": Claude Code headless (default); "codex": Codex CLI
+AGENT_BACKEND = os.environ.get("CTLE_AGENT", "claude").lower()  # claude | codex: the one switch for the reader, the adjudicator and the equipment judge (2026-10-06: Claude current; 2026-10-20: same process on both)
 CLAUDE_MODEL = os.environ.get("CTLE_CLAUDE_MODEL", "sonnet")
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
@@ -87,24 +87,67 @@ def run_prompt(work: Path, prompt: str, tag: str = "", timeout_seconds: float = 
     started = time.time()
     if AGENT_BACKEND == "claude":
         return _run_claude(work, prompt, env, started, timeout_seconds, tag, answer_key, model or CLAUDE_MODEL)
-    command = [executable, "-a", "never", "-s", "workspace-write", "-c", "model_reasoning_effort=xhigh", "-c", f"service_tier={SERVICE_TIER}", "exec", "--skip-git-repo-check", "-o", str(work / f"answer{tag}.txt"), "-"]
-    completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, cwd=str(work), env=env)
+    return _run_codex(work, prompt, env, started, timeout_seconds, tag, answer_key, executable)
+
+
+UNATTENDED_NOTE = ("这是一个无人值守的自动读图任务：不要向用户提问、不要等待确认、不要写计划、不要改代码或提交；"
+                   "其他说明文件里关于汇报、计划、日志的要求不适用于本任务。只用提示里给的工具读图，最后一条回复只输出 JSON。")
+CLAUDE_SYSTEM_NOTE = UNATTENDED_NOTE  # Claude gets it as a system prompt
+CODEX_NOTE = UNATTENDED_NOTE + "工具画出的图片要等那条命令返回后再打开，不要和命令并行去看。"  # Codex gets it at the top of the prompt (2026-10-20: it opened pictures before they were drawn)
+
+
+def run_cli(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    """`subprocess.run` that turns a hung CLI into a failed result (returncode -1, partial output kept) instead of an exception."""
+
+    try:
+        return subprocess.run(command, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        def text(value: Any) -> str:
+            return value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+        return subprocess.CompletedProcess(command, -1, text(exc.stdout), text(exc.stderr) + f"\n[timeout after {exc.timeout:.0f} s]\n")
+
+
+def _run_codex(work: Path, prompt: str, env: dict[str, str], started: float, timeout_seconds: float, tag: str,
+               answer_key: str = "buildings", executable: str = "codex") -> dict[str, Any]:
+    """The same read with Codex CLI (`codex exec`, the account's current model); the same record keys as the Claude run."""
+
+    command = [executable, "-a", "never", "-s", "workspace-write", "-c", "model_reasoning_effort=xhigh", "-c", f"service_tier={SERVICE_TIER}",
+               "exec", "--skip-git-repo-check", "-o", str(work / f"answer{tag}.txt"), "-"]
+    completed = run_cli(command, input=CODEX_NOTE + "\n\n" + prompt, capture_output=True, text=True, encoding="utf-8",
+                        timeout=timeout_seconds, cwd=str(work), env=env)
     (work / f"events{tag}.txt").write_text(completed.stdout, encoding="utf-8")
     (work / f"stderr{tag}.txt").write_text(completed.stderr, encoding="utf-8")
-    tokens = None
+    tokens, model, tool_calls = None, None, 0
     lines = completed.stderr.splitlines()
     for i, line in enumerate(lines):
-        if line.strip().lower() == "tokens used" and i + 1 < len(lines):
+        if line.strip().lower() == "tokens used" and i + 1 < len(lines):  # the CLI prints "tokens used" then the count
             digits = lines[i + 1].strip().replace(",", "")
             tokens = int(digits) if digits.isdigit() else tokens
+        elif line.startswith("model:") and model is None:  # the header of the transcript
+            model = line.split(":", 1)[1].strip() or None
+        elif line.strip() == "exec" and i + 1 < len(lines) and "agent_tools" in lines[i + 1]:  # one tool command run
+            tool_calls += 1
     answer_path = work / f"answer{tag}.txt"
     text = answer_path.read_text(encoding="utf-8") if answer_path.is_file() else ""
+    answer, earlier = _json_from(text), answer_from_transcript(completed.stderr, answer_key)
+    from_earlier = answer is None and earlier is not None
+    answer = answer if answer is not None else earlier  # the JSON was given, then followed by another message
     return {"returncode": completed.returncode, "minutes": round((time.time() - started) / 60, 1), "tokens_used": tokens,
-            "tool_calls": completed.stderr.count("agent_tools"), "answer": _json_from(text), "raw_answer": text}
+            "tokens_detail": {}, "cost_usd_equivalent": None, "plan_usage_seen": [], "tool_calls": tool_calls, "model": model,
+            "answer": answer, "answer_from_earlier_message": from_earlier, "raw_answer": text}
 
 
-CLAUDE_SYSTEM_NOTE = ("这是一个无人值守的自动读图任务：不要向用户提问、不要等待确认、不要写计划、不要改代码或提交；"
-                      "其他说明文件里关于汇报、计划、日志的要求不适用于本任务。只用提示里给的工具读图，最后一条回复只输出 JSON。")
+def answer_from_transcript(stderr: str, key: str = "buildings") -> dict[str, Any] | None:
+    """The last line of a Codex transcript that is the answer JSON (it has `key`, e.g. "buildings")."""
+
+    found = None
+    for line in stderr.splitlines():
+        if "{" not in line:
+            continue
+        value = _json_from(line)
+        if value is not None and key in value:
+            found = value
+    return found
 
 
 def _run_claude(work: Path, prompt: str, env: dict[str, str], started: float, timeout_seconds: float, tag: str,
@@ -115,7 +158,7 @@ def _run_claude(work: Path, prompt: str, env: dict[str, str], started: float, ti
     command = ["claude", "-p", "--model", model, "--output-format", "stream-json", "--verbose", "--no-session-persistence",
                "--strict-mcp-config", "--allowedTools", "Bash", "Read", "Glob", "Grep", "--disallowedTools", "Write", "Edit", "NotebookEdit",
                "--append-system-prompt", CLAUDE_SYSTEM_NOTE]
-    completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, cwd=str(work), env=env)
+    completed = run_cli(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, cwd=str(work), env=env)
     (work / f"events{tag}.txt").write_text(completed.stdout, encoding="utf-8")
     (work / f"stderr{tag}.txt").write_text(completed.stderr, encoding="utf-8")
     text, usage, limits, cost, tool_calls = "", {}, [], None, 0
@@ -555,7 +598,7 @@ def read_once(work: Path, designation: str | None, info: dict[str, Any] | None =
     result = {"schema": "ctle-agent-read-1.0", "prompt_id": PROMPT_ID, "prompt_sha256": hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest(),
               "designation_input": designation, "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "index": info,
               "minutes": run["minutes"], "tokens_used": run["tokens_used"], "returncode": run["returncode"], "answer_parsed": bool(run["answer"]),
-              "backend": AGENT_BACKEND, "model": CLAUDE_MODEL if AGENT_BACKEND == "claude" else None,
+              "backend": AGENT_BACKEND, "model": run.get("model"),
               "plan_usage_seen": [run.get("plan_usage_seen")], "cost_usd_equivalent": run.get("cost_usd_equivalent"),
               "answer_from_earlier_message": bool(run.get("answer_from_earlier_message"))}
     problems = feedback(work, answer, checks) if answer else []

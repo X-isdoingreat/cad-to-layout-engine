@@ -253,7 +253,7 @@ def run(work: Path, answer: dict[str, Any], checks: list[dict[str, Any]], found:
     record.update({"status": "answered" if done["answer"] else "no_answer", "verdicts": validate_verdicts(done["answer"], disc),
                    "minutes": done["minutes"], "tokens_used": done["tokens_used"], "tool_calls": done["tool_calls"],
                    "over_budget": (done["tool_calls"] or 0) > budget, "cost_usd_equivalent": done.get("cost_usd_equivalent"),
-                   "backend": agent_reader.AGENT_BACKEND, "model": done.get("model") if agent_reader.AGENT_BACKEND == "claude" else None,
+                   "backend": agent_reader.AGENT_BACKEND, "model": done.get("model"),
                    "notes": str((done["answer"] or {}).get("notes") or "")})
     return record
 

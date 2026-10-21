@@ -25,7 +25,7 @@ one sentence.
 - AutoCAD（可选，任意 2013 及以后版本）：用它转换和截图更稳；没有 AutoCAD 时用 ODA + 程序自绘图片。
 - 一个 AI 命令行工具（必需，二选一），读图、定夺和判断设备类型时由程序调用，用你自己的账号；用环境变量 `CTLE_AGENT` 选：
   - `claude`（默认）：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)，调用 `claude -p`。厂房尺寸、定夺、设备判断都在它上面验证过。一张图读一遍约 40 万～150 万 token，账号套餐要够量。
-  - `codex`：[Codex CLI](https://github.com/openai/codex)，调用 `codex exec`。厂房尺寸读图验证过一张（与 Claude 的结果差 0.01%，图上尺寸对上，复查包齐全；Codex 报约 10 万 token）；定夺和设备判断在它上面还没跑过。
+  - `codex`：[Codex CLI](https://github.com/openai/codex)，调用 `codex exec`。三步（厂房尺寸读图、定夺、设备判断）都在它上面各跑通过一次，记录字段与 Claude 一致；厂房尺寸那张与 Claude 的结果差 0.01%、图上尺寸对上。注意：ChatGPT 免费档的额度一张设备图跑不完（读一张厂房约 10 万 token、定夺约 8 万，设备判断几十次调用），额度用完时程序把这些调用记为无效、对应设备标"未判"并继续出包，档案里能看到报错原文。
 
   **图纸内容会发送到所选 AI 服务（Anthropic 或 OpenAI），请先征得图纸所有者同意。**
 - 中文字体：报告和 DWG 标签用微软雅黑（中文 Windows 自带）；没有这个字体的机器上中文会显示成方块，程序不会报错。
