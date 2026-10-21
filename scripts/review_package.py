@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from scripts.drawing_report import AI_SERVICE  # noqa: E402
 from scripts.equipment_review import _matplotlib  # noqa: E402
 from scripts.trial_package import wrap_keep  # noqa: E402
 
@@ -61,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
                        "我们收到后先复述一遍您的意思，确认无误后更新结果，每个数字注明是系统识别还是人工核对。也请告诉我们看了几分钟。"]),
             ("各文件夹", [f"{folder}：{note}" if note else folder for folder, note, _ in rows]),
             ("说明", ["以上结果均为系统识别，尚未经人工核对。厂房面积按外墙外边线围成的占地面积计，多层只算指定楼层；净高需客户提供。",
-                    "识别时图纸内容会发送至 Anthropic 的 AI 服务处理，请事先征得图纸所有者同意；原图从不被修改。"]),
+                    f"识别时图纸内容会发送至 {AI_SERVICE} 的 AI 服务处理，请事先征得图纸所有者同意；原图从不被修改。"]),
         ]
         for title, lines in blocks:
             figure.text(0.07, y, title, fontsize=13, weight="bold")

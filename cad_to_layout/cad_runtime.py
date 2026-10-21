@@ -189,6 +189,7 @@ def _program_render(drawing: Path, window: list[float], png: Path, timeout: floa
     import matplotlib
 
     matplotlib.use("Agg")
+    matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]  # Chinese labels on the picture (2026-10-20)
     from matplotlib import pyplot
 
     from .zero_manual import agent_tools
