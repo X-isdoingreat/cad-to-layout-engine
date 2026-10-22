@@ -73,8 +73,10 @@ def claude_exec_transport(executable: str = "claude", model: str = "sonnet", tim
         full = f"先用 Read 工具打开这张图片再回答：{image}\n\n{prompt}"
         command = [executable, "-p", "--model", model, "--output-format", "json", "--no-session-persistence", "--strict-mcp-config",
                    "--allowedTools", "Read", "--disallowedTools", "Bash", "Write", "Edit", "NotebookEdit"]
+        from .agent_reader import subscription_env
+
         completed = run_cli(command, input=full, capture_output=True, text=True, encoding="utf-8",
-                            timeout=timeout_seconds, cwd=str(image.parent))
+                            timeout=timeout_seconds, cwd=str(image.parent), env=subscription_env())
         (work_dir / "events.jsonl").write_text(completed.stdout, encoding="utf-8")
         (work_dir / "stderr.txt").write_text(completed.stderr, encoding="utf-8")
         try:
@@ -94,10 +96,14 @@ def claude_exec_transport(executable: str = "claude", model: str = "sonnet", tim
 
 
 def external_transport() -> Transport:
-    """The judge chosen by the same switch as the reading agent (`agent_reader.AGENT_BACKEND`: claude by default | codex)."""
+    """The judge chosen by the same switch as the reading agent (`agent_reader.AGENT_BACKEND`: claude by default | codex | api)."""
 
     from .agent_reader import AGENT_BACKEND
 
+    if AGENT_BACKEND == "api":
+        from .api_agent import api_transport
+
+        return api_transport()
     return codex_exec_transport() if AGENT_BACKEND == "codex" else claude_exec_transport()
 
 

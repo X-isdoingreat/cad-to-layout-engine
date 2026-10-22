@@ -13,8 +13,9 @@ Never pick an AutoCAD version for them; ask which installation to use if several
 If the user says which CAD they have ("我们用的是 AutoCAD 2024", "没有 AutoCAD"), follow the `setup-cad` skill first.
 
 The AI that reads the drawing inside the command is chosen by the environment variable `CTLE_AGENT`:
-`claude` (default; needs Claude Code logged in) or `codex` (needs Codex CLI logged in). See README "需要什么" for
-what each has been verified to do.
+`claude` (default; needs Claude Code logged in), `codex` (needs Codex CLI logged in) or `api` (the program calls the
+Anthropic API itself; needs `ANTHROPIC_API_KEY`, optional `CTLE_API_MODEL`). See README "需要什么" for what each has
+been verified to do.
 
 ## 1. What to read
 

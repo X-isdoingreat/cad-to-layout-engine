@@ -4,3 +4,4 @@ matplotlib>=3.8
 PyMuPDF>=1.24
 pillow>=10.0
 numpy>=1.26
+anthropic>=2.0  # only for CTLE_AGENT=api

@@ -29,7 +29,7 @@ from cad_to_layout.zero_manual.equipment import LABEL_ZH  # noqa: E402
 from scripts.equipment_review import COLOURS, WAREHOUSE_TYPES, _block_of, _index, _load, _matplotlib, _tile, items_of, not_counted  # noqa: E402
 from scripts.trial_package import wrap_keep  # noqa: E402
 
-AI_SERVICE = "OpenAI" if os.environ.get("CTLE_AGENT", "claude").lower() == "codex" else "Anthropic"  # named in the report footer
+AI_SERVICE = "OpenAI" if os.environ.get("CTLE_AGENT", "claude").lower() == "codex" else "Anthropic"  # named in the report footer (claude and api both send to Anthropic)
 
 PAGE = (11.69, 8.27)
 UNIT = {"RACK": "格", "PALLET_CONV_CHAIN": "段", "PALLET_CONV_ROLLER": "段", "CONVEYOR_UNKNOWN_SUBTYPE": "段", "BOX_CONVEYOR": "段"}

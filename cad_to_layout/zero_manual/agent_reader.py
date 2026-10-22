@@ -26,7 +26,7 @@ from . import agent_tools
 PROMPT_PATH = Path(__file__).with_name("agent_reader_prompt_v11.md")  # v11 (2026-10-16): `trace` candidates held against the drawing's own numbers; paged lists
 PROMPT_ID = "agent_reader_prompt_v11"
 SERVICE_TIER = "fast"  # 2026-10-05: faster responses (uses the plan's allowance faster)
-AGENT_BACKEND = os.environ.get("CTLE_AGENT", "claude").lower()  # claude | codex: the one switch for the reader, the adjudicator and the equipment judge (2026-10-06: Claude current; 2026-10-20: same process on both)
+AGENT_BACKEND = os.environ.get("CTLE_AGENT", "claude").lower()  # claude | codex | api: the one switch for the reader, the adjudicator and the equipment judge (2026-10-06: Claude current; 2026-10-20: same process on both)
 CLAUDE_MODEL = os.environ.get("CTLE_CLAUDE_MODEL", "sonnet")
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
@@ -85,6 +85,10 @@ def run_prompt(work: Path, prompt: str, tag: str = "", timeout_seconds: float = 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(PACKAGE_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     started = time.time()
+    if AGENT_BACKEND == "api":  # the program calls the model API itself (2026-10-21)
+        from .api_agent import run_api
+
+        return run_api(work, prompt, started, timeout_seconds, tag, answer_key, model)
     if AGENT_BACKEND == "claude":
         return _run_claude(work, prompt, env, started, timeout_seconds, tag, answer_key, model or CLAUDE_MODEL)
     return _run_codex(work, prompt, env, started, timeout_seconds, tag, answer_key, executable)
@@ -105,6 +109,13 @@ def run_cli(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         def text(value: Any) -> str:
             return value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
         return subprocess.CompletedProcess(command, -1, text(exc.stdout), text(exc.stderr) + f"\n[timeout after {exc.timeout:.0f} s]\n")
+
+
+def subscription_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment for a `claude -p` run: no API key, so Claude Code bills the logged-in subscription
+    (with ANTHROPIC_API_KEY set, `-p` switches to API billing without asking - Claude Code docs, authentication)."""
+
+    return {k: v for k, v in (os.environ if env is None else env).items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
 
 
 def _run_codex(work: Path, prompt: str, env: dict[str, str], started: float, timeout_seconds: float, tag: str,
@@ -158,7 +169,8 @@ def _run_claude(work: Path, prompt: str, env: dict[str, str], started: float, ti
     command = ["claude", "-p", "--model", model, "--output-format", "stream-json", "--verbose", "--no-session-persistence",
                "--strict-mcp-config", "--allowedTools", "Bash", "Read", "Glob", "Grep", "--disallowedTools", "Write", "Edit", "NotebookEdit",
                "--append-system-prompt", CLAUDE_SYSTEM_NOTE]
-    completed = run_cli(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, cwd=str(work), env=env)
+    completed = run_cli(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds, cwd=str(work),
+                        env=subscription_env(env))
     (work / f"events{tag}.txt").write_text(completed.stdout, encoding="utf-8")
     (work / f"stderr{tag}.txt").write_text(completed.stderr, encoding="utf-8")
     text, usage, limits, cost, tool_calls = "", {}, [], None, 0
