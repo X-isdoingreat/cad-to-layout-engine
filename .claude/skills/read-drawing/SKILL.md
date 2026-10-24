@@ -37,12 +37,16 @@ user where it is (building done / equipment judging / report) when they ask. The
 
 ## 3. Hand over
 
-Open `<folder>/图纸识别报告.pdf`. Summarise in product language, in this order:
-- building: name, area, length × width — say it is a system reading to be checked along the red line;
+Read `<folder>/结果.json` first (`status_code`: `ok` / `failed` / `equipment_llm_failed`; `area.building.status_code`:
+`matches_drawing` 与图上数字一致 / `two_methods_agree` 两种方法一致 / `undecided` 待定 / `failed`), then open
+`<folder>/图纸识别报告.pdf`. Summarise in product language, in this order:
+- building: name, area, length × width, its status in words, and the `wrong_if` sentence (what would make the number
+  wrong); for `undecided` give both numbers with their methods and say the red line is worth a look; for `failed` give
+  the reason and no number;
 - equipment: the main types and counts on the plan shown;
 - how many places need confirmation (part 三) and how to reply (one sentence with the numbers);
 - what was not read (e.g. equipment drawn as loose lines or parts, other floors, height).
-Never call an unreviewed number correct.
+Never call a number correct beyond its status: 与图上数字一致 and 两种方法一致 are system findings, 待定 is two numbers, not one.
 
 ## 4. The reviewer's reply
 

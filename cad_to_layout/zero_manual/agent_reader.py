@@ -23,8 +23,15 @@ from typing import Any
 
 from . import agent_tools
 
-PROMPT_PATH = Path(__file__).with_name("agent_reader_prompt_v11.md")  # v11 (2026-10-16): `trace` candidates held against the drawing's own numbers; paged lists
-PROMPT_ID = "agent_reader_prompt_v11"
+PROMPT_PATH = Path(__file__).with_name("agent_reader_prompt_v12.md")  # v12 (2026-10-23): v11 + the shared risk checklist and a mandatory risk_review
+PROMPT_ID = "agent_reader_prompt_v12"
+# Two readers by different methods (CEO 2026-10-22, target cross_method_reading_20261023): "wall" traces the outer wall line,
+# "structure" infers the envelope from the axis grid, the column field and the wall thickness.  Both get the same checklist of
+# error-prone spots and must answer it item by item; the second reader never sees the first's result.
+PROMPTS = {"wall": (PROMPT_ID, PROMPT_PATH), "structure": ("reader_b_prompt_v1", Path(__file__).with_name("reader_b_prompt_v1.md"))}
+RISK_CHECKLIST_PATH = Path(__file__).with_name("risk_checklist_v1.md")
+RISK_CHECKLIST_ID = "risk_checklist_v1"
+RISK_IDS = [line.split()[0] for line in RISK_CHECKLIST_PATH.read_text(encoding="utf-8").splitlines() if line[:1] == "R" and line[1:2].isdigit()]
 SERVICE_TIER = "fast"  # 2026-10-05: faster responses (uses the plan's allowance faster)
 AGENT_BACKEND = os.environ.get("CTLE_AGENT", "claude").lower()  # claude | codex | api: the one switch for the reader, the adjudicator and the equipment judge (2026-10-06: Claude current; 2026-10-20: same process on both)
 CLAUDE_MODEL = os.environ.get("CTLE_CLAUDE_MODEL", "sonnet")
@@ -64,13 +71,21 @@ def prepare(dxf: Path, work: Path) -> dict[str, Any]:
 
 
 def run_agent(work: Path, designation: str | None, executable: str = "codex", timeout_seconds: float = 3600.0,
-              extra: str | None = None, tag: str = "") -> dict[str, Any]:
+              extra: str | None = None, tag: str = "", method: str = "wall") -> dict[str, Any]:
     work = work.resolve()
     python = '"' + sys.executable + '"'  # the agent's sandbox may not see the py launcher
-    prompt = PROMPT_PATH.read_text(encoding="utf-8").replace("{PY}", python) + "\n\n## 本次指定的建筑\n\n" + (designation or "未指定（没有给出指定）") + "\n"
+    prompt = (PROMPTS[method][1].read_text(encoding="utf-8").replace("{PY}", python).replace("{RISK_CHECKLIST}", RISK_CHECKLIST_PATH.read_text(encoding="utf-8").strip())
+              + "\n\n## 本次指定的建筑\n\n" + (designation or "未指定（没有给出指定）") + "\n")
     if extra:
         prompt += "\n" + extra
     return run_prompt(work, prompt, tag=tag, timeout_seconds=timeout_seconds, executable=executable)
+
+
+def risk_review_missing(answer: dict[str, Any]) -> list[str]:
+    """Checklist items the answer did not account for (no row, or a row without a yes/no `checked`)."""
+
+    rows = {str(r.get("id")): r for r in answer.get("risk_review") or [] if isinstance(r, dict)}
+    return [rid for rid in RISK_IDS if rid not in rows or not isinstance(rows[rid].get("checked"), bool)]
 
 
 def run_prompt(work: Path, prompt: str, tag: str = "", timeout_seconds: float = 3600.0, executable: str = "codex",
@@ -401,6 +416,10 @@ def findings(work: Path, answer: dict[str, Any], checks: list[dict[str, Any]]) -
         return out_parts
 
     m = float(answer.get("unit_m") or 0) or None
+    missing = risk_review_missing(answer)
+    if missing and answer.get("buildings"):  # every item of the shared checklist must be answered (target rule 3)
+        add("risk_review", next((b.get("name") for b in answer["buildings"] if b.get("designated")), None),
+            f"risk_review 里缺了 {'、'.join(missing)}：“容易出错的地方”每一条都要写 checked（true/false）、what_seen 和 if_wrong_effect_m2，没查的也要写明为什么。")
     faces_path = work / agent_tools.FACES.name
     faces = json.loads(faces_path.read_text(encoding="utf-8")) if faces_path.is_file() else {}
     runs_path = work / agent_tools.COLUMNS.name
@@ -539,6 +558,26 @@ def feedback(work: Path, answer: dict[str, Any], checks: list[dict[str, Any]]) -
     return [f["text"] for f in findings(work, answer, checks)]
 
 
+EXPLAINED_KINDS = {"dimension", "stated_area"}  # a drawing number the reader has already addressed in `unresolved` is not sent back again
+
+
+def explained(finding: dict[str, Any], answer: dict[str, Any]) -> bool:
+    """The reader already wrote about this drawing number in `unresolved` (the value appears there): revising again only repeats
+    the explanation (2026-10-23: a 190 m axis dimension cost three revision rounds per reader).  The finding still reaches the reviewer."""
+
+    if finding.get("kind") not in EXPLAINED_KINDS:
+        return False
+    said = " ".join(f"{u.get('item', '')} {u.get('why', '')}" for u in answer.get("unresolved") or [] if isinstance(u, dict))
+    numbers = {n.replace(",", "") for n in re.findall(r"\d[\d,]*(?:\.\d+)?", finding.get("text", "")) if len(n.replace(",", "")) >= 2}
+    return any(n in said.replace(",", "") for n in numbers)
+
+
+def revision_problems(work: Path, answer: dict[str, Any], checks: list[dict[str, Any]]) -> list[str]:
+    """What goes back to the reader for a revision round: the findings it has not already explained."""
+
+    return [f["text"] for f in findings(work, answer, checks) if not explained(f, answer)]
+
+
 def _columns_check(work: Path, building: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     """The reported column count against the tool's own count for the same faces."""
 
@@ -601,26 +640,32 @@ def reselect(work: Path) -> dict[str, Any]:
     return read
 
 
-def read_once(work: Path, designation: str | None, info: dict[str, Any] | None = None, revise: bool = True) -> dict[str, Any]:
-    """One agent read with the program's check; if the check finds problems, one revision round with them."""
+def read_once(work: Path, designation: str | None, info: dict[str, Any] | None = None, revise: bool = True, method: str = "wall",
+              adjudicate: bool | None = None) -> dict[str, Any]:
+    """One agent read with the program's check; if the check finds problems, one revision round with them.
 
-    run = run_agent(work, designation)
+    `method` picks the reader (wall | structure, see PROMPTS); `adjudicate` None follows ADJUDICATE (the single-read
+    adjudication); the two-method flow passes False and adjudicates the pair afterwards (adjudicator.adjudicate_pair)."""
+
+    prompt_id, prompt_path = PROMPTS[method]
+    run = run_agent(work, designation, method=method)
     answer = run["answer"] or {}
     checks = verify(work, answer) if answer else []
-    result = {"schema": "ctle-agent-read-1.0", "prompt_id": PROMPT_ID, "prompt_sha256": hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest(),
+    result = {"schema": "ctle-agent-read-1.0", "prompt_id": prompt_id, "prompt_sha256": hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
+              "method": method, "risk_checklist_id": RISK_CHECKLIST_ID, "risk_checklist_sha256": hashlib.sha256(RISK_CHECKLIST_PATH.read_bytes()).hexdigest(),
               "designation_input": designation, "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "index": info,
               "minutes": run["minutes"], "tokens_used": run["tokens_used"], "returncode": run["returncode"], "answer_parsed": bool(run["answer"]),
               "backend": AGENT_BACKEND, "model": run.get("model"),
               "plan_usage_seen": [run.get("plan_usage_seen")], "cost_usd_equivalent": run.get("cost_usd_equivalent"),
               "answer_from_earlier_message": bool(run.get("answer_from_earlier_message"))}
-    problems = feedback(work, answer, checks) if answer else []
+    problems = revision_problems(work, answer, checks) if answer else []
     rounds = []
     for n in range(1, (MAX_REVISIONS if revise else 0) + 1):
         if not answer or not problems:
             break
         extra = (REVISION_HEADER + "\n### 问题\n\n" + "\n".join(f"{k}. {p}" for k, p in enumerate(problems, 1))
                  + "\n\n### 你上一轮的答案\n\n" + json.dumps(answer, ensure_ascii=False) + "\n")
-        again = run_agent(work, designation, extra=extra, tag=f"_rev{n}")
+        again = run_agent(work, designation, extra=extra, tag=f"_rev{n}", method=method)
         rounds.append({"round": n, "answer_before": answer, "feedback": problems, "minutes": again["minutes"], "tokens_used": again["tokens_used"],
                        "parsed": bool(again["answer"])})
         result["minutes"] = round(result["minutes"] + again["minutes"], 1)
@@ -632,7 +677,7 @@ def read_once(work: Path, designation: str | None, info: dict[str, Any] | None =
             break
         answer = again["answer"]
         checks = verify(work, answer)
-        problems = feedback(work, answer, checks)
+        problems = revision_problems(work, answer, checks)
     if rounds:
         result.update({"revisions": rounds, "first_answer": rounds[0]["answer_before"], "feedback": rounds[0]["feedback"], "last_answer": answer})
         best = best_round(work, [v["answer_before"] for v in rounds] + [answer])
@@ -642,7 +687,12 @@ def read_once(work: Path, designation: str | None, info: dict[str, Any] | None =
             checks = verify(work, answer)
     result.update({"answer": answer, "checks": checks, "zone_check": verify_zones(work, answer) if answer else {},
                    "remaining_feedback": feedback(work, answer, checks) if answer else []})
-    if ADJUDICATE and answer:  # 2026-10-16: the program's discrepancies go to a second, narrowly scoped agent call
+    missing = risk_review_missing(answer) if answer else list(RISK_IDS)
+    result.update({"risk_review_missing": missing, "risk_review_complete": not missing,
+                   # a read counts only when it parsed and answered the whole checklist (target rule 3; the strictness is an assistant default)
+                   "valid": bool(answer.get("buildings")) and not missing,
+                   "method_available": bool(answer.get("method_available", True)) if answer else False})
+    if (ADJUDICATE if adjudicate is None else adjudicate) and answer:  # 2026-10-16: the program's discrepancies go to a second, narrowly scoped agent call
         from . import adjudicator
 
         result = adjudicator.adjudicate_read(work, result)
@@ -657,4 +707,4 @@ def read_with_agent(dxf: Path, work: Path, designation: str | None) -> dict[str,
     return result
 
 
-__all__ = ["feedback", "findings", "prepare", "read_once", "read_with_agent", "run_agent", "run_prompt", "verify", "verify_zones"]
+__all__ = ["feedback", "findings", "prepare", "read_once", "read_with_agent", "risk_review_missing", "run_agent", "run_prompt", "verify", "verify_zones"]

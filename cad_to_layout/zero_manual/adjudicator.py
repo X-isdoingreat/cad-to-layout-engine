@@ -299,4 +299,371 @@ def ensure(work: Path, force: bool = False, timeout_seconds: float = 1800.0) -> 
     return read["adjudication"]
 
 
-__all__ = ["adjudicate_read", "apply_verdicts", "discrepancies", "ensure", "run", "validate_verdicts"]
+# ---------------------------------------------------------------- two readers by different methods, one reviewer (2026-10-23)
+# Target cross_method_reading_20261023: reader A traces the outer wall, reader B infers the envelope from the axis grid and the
+# columns, blind to A.  The program compares the two, measures its own axis/wall geometry round the building, computes where the
+# two outlines differ, and only then asks the reviewer AI - which may adopt A, adopt B, draw its own face (adopted only when the
+# program's re-measurement matches a drawing-stated number) or leave it undecided (both numbers shown).  The result carries a
+# machine-readable status: matches_drawing / two_methods_agree / undecided / failed, plus the source of the adopted number.
+PAIR_PROMPT_PATH = Path(__file__).with_name("adjudicator_prompt_v4.md")
+PAIR_PROMPT_ID = "adjudicator_prompt_v4"
+DECISIONS = ("adopt_a", "adopt_b", "both_wrong", "undecided")
+STATUS_CN = {"matches_drawing": "与图上数字一致", "two_methods_agree": "两种方法一致", "undecided": "待定", "failed": "读不出"}
+SOURCE_CN = {"a": "甲（沿外墙描）", "b": "乙（按结构推）", "reviewer": "复查 AI 重描"}
+METHOD_CN = {"wall": "沿外墙描", "structure": "按轴网、柱网推"}
+
+
+def _designated_of(read: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The designated building and its check row of a valid read that measured an outline; else None."""
+
+    if not read or not read.get("valid", bool((read.get("answer") or {}).get("buildings"))):
+        return None
+    answer = read.get("answer") or {}
+    b = next((b for b in answer.get("buildings") or [] if b.get("designated")), None)
+    c = next((c for c in read.get("checks") or [] if b and c.get("name") == b.get("name") and c.get("outline")), None)
+    return (b, c) if b and c else None
+
+
+def numbers_agree(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Area, length and width all within TWO_METHOD_AGREE_FRACTION of the larger value."""
+
+    from .constants import TWO_METHOD_AGREE_FRACTION
+
+    for k in ("area_m2", "length_m", "width_m"):
+        x, y = float(a.get(k) or 0), float(b.get(k) or 0)
+        if abs(x - y) > TWO_METHOD_AGREE_FRACTION * max(x, y, 1e-9):
+            return False
+    return True
+
+
+def difference_region(outline_a: list[Any], outline_b: list[Any], m: float) -> dict[str, Any]:
+    """Where the two outlines differ: the pieces of their symmetric difference, largest first, each with its side, area and place."""
+
+    from shapely.geometry import Polygon
+
+    pa, pb = Polygon(outline_a).buffer(0), Polygon(outline_b).buffer(0)
+    pieces = []
+    for only_in, geom in (("a", pa.difference(pb)), ("b", pb.difference(pa))):
+        for g in getattr(geom, "geoms", [geom]):
+            if g.is_empty or g.geom_type != "Polygon":
+                continue
+            x0, y0, x1, y1 = g.bounds
+            pieces.append({"only_in": only_in, "area_m2": round(g.area * m * m, 1), "at": [round(g.representative_point().x, 3), round(g.representative_point().y, 3)],
+                           "bbox": [round(v, 3) for v in (x0, y0, x1, y1)], "outline": [[round(x, 3), round(y, 3)] for x, y in g.exterior.coords]})
+    pieces.sort(key=lambda p: -p["area_m2"])
+    in_a = round(sum(p["area_m2"] for p in pieces if p["only_in"] == "a"), 1)
+    in_b = round(sum(p["area_m2"] for p in pieces if p["only_in"] == "b"), 1)
+    words = "；".join(f"{'甲有乙无' if p['only_in'] == 'a' else '乙有甲无'}的一块约 {p['area_m2']:,.0f} m²，在 ({p['at'][0]:.0f}, {p['at'][1]:.0f}) 附近" for p in pieces[:4])
+    return {"difference_m2": round(in_a + in_b, 1), "in_a_not_b_m2": in_a, "in_b_not_a_m2": in_b, "pieces": pieces[:8], "description": words or "两条轮廓重合"}
+
+
+def import_face(work: Path, outline: list[Any], m: float, made_by: str) -> str:
+    """Store another read's outline as a face in this work folder, so the reviewer can render and measure it here."""
+
+    from shapely.geometry import Polygon
+
+    path = work / agent_tools.FACES.name
+    faces = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    poly = Polygon(outline).buffer(0)
+    long_side, short_side, angle = agent_tools._mrr(poly)
+    fid = f"F{len(faces) + 1}"
+    faces[fid] = {"area_m2": round(poly.area * m * m, 2), "length_m": round(long_side * m, 2), "width_m": round(short_side * m, 2), "orientation_deg": round(angle, 2),
+                  "centroid": [round(poly.centroid.x, 3), round(poly.centroid.y, 3)], "texts_inside": [], "outline": [[round(x, 3), round(y, 3)] for x, y in poly.exterior.coords],
+                  "layers_used": [], "made_by": made_by}
+    path.write_text(json.dumps(faces, ensure_ascii=False), encoding="utf-8")
+    return fid
+
+
+def drawing_matches(check: dict[str, Any]) -> list[dict[str, Any]]:
+    """Drawing-stated numbers the measured outline agrees with: an area note within tolerance, an end-to-end dimension within tolerance."""
+
+    hits = []
+    for s in (check.get("stated_area_check") or {}).get("compared") or []:
+        if not s.get("flagged"):
+            hits.append({"kind": "stated_area", "drawing": s.get("text"), "drawing_value": s.get("value_m2"), "differs_pct": s.get("differs_pct")})
+    for d in check.get("dimension_check") or []:
+        if not d.get("flagged") and d.get("dimension_m"):
+            hits.append({"kind": "dimension", "drawing": f"总尺寸 {d['dimension_m']:g} m", "drawing_value": d["dimension_m"], "differs_pct": d.get("differs_pct")})
+    return hits
+
+
+def program_geometry(work: Path, dxf: str | None, outlines: list[list[Any]], m: float) -> dict[str, Any]:
+    """The program's own axis/wall measurement round the building (cached in the work folder; no AI)."""
+
+    cache = work / "program_geometry.json"
+    if cache.is_file():
+        return json.loads(cache.read_text(encoding="utf-8"))
+    if not dxf or not Path(dxf).is_file():
+        return {"status": "no_dxf", "message_zh": "没有 DXF，程序几何未算"}
+    try:
+        import ezdxf
+
+        from . import warehouse_geometry as wg
+
+        doc = ezdxf.readfile(dxf)
+        out = wg.measure_building(wg.collect_structure(doc), outlines, m, [])
+        out["status"] = "measured"
+    except Exception as exc:  # the reference is optional: a drawing the structure walker cannot read leaves it out, visibly
+        out = {"status": "error", "message_zh": f"程序几何未算：{type(exc).__name__}: {str(exc)[:200]}"}
+    cache.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    return out
+
+
+def _geometry_words(g: dict[str, Any]) -> str:
+    if g.get("status") != "measured":
+        return g.get("message_zh") or "程序几何未算"
+    parts = []
+    ax, wall = g.get("axis") or {}, g.get("wall") or {}
+    parts.append(f"轴网：{'首末轴距 ' + str(ax.get('length_m')) + ' m × ' + str(ax.get('width_m')) + ' m' if ax.get('status') == 'found' else (ax.get('message_zh') or ax.get('status'))}")
+    parts.append(f"墙线闭合外廓：{str(wall.get('length_m')) + ' m × ' + str(wall.get('width_m')) + ' m，' + str(wall.get('area_m2')) + ' m²' if wall.get('status') == 'found' else (wall.get('message_zh') or wall.get('status'))}")
+    return "；".join(parts)
+
+
+def _risk_words(answer: dict[str, Any]) -> str:
+    rows = [r for r in answer.get("risk_review") or [] if isinstance(r, dict)]
+    if not rows:
+        return "（没有写 risk_review）"
+    return "\n".join(f"    - {r.get('id')}：{'查过' if r.get('checked') else '没查'}；{str(r.get('what_seen') or '')[:160]}；若错影响约 {r.get('if_wrong_effect_m2') or 0} m²" for r in rows)
+
+
+def _reader_words(label: str, read: dict[str, Any], b: dict[str, Any], c: dict[str, Any], face_ids: list[str]) -> list[str]:
+    answer = read.get("answer") or {}
+    got = _measured(c)
+    lines = [f"- {label}（方法：{METHOD_CN.get(read.get('method'), read.get('method'))}）：面 {' '.join(face_ids)}；面积 {float(got.get('area_m2') or 0):,.2f} m²，"
+             f"长 {got.get('length_m')} m × 宽 {got.get('width_m')} m。理由：{str(b.get('evidence') or '')[:400]}"]
+    if answer.get("structure"):
+        lines.append(f"  结构推算：{json.dumps(answer['structure'], ensure_ascii=False)[:300]}")
+    if answer.get("method_available") is False:
+        lines.append("  （这张图上该方法不可用，退回沿外墙描）")
+    for u in (answer.get("unresolved") or [])[:5]:
+        lines.append(f"  拿不准：{str(u.get('item') or '')[:80]}——{str(u.get('why') or '')[:160]}")
+    lines.append("  容易出错的地方的核查：")
+    lines.append(_risk_words(answer))
+    return lines
+
+
+def pair_discrepancies(read_a: dict[str, Any], read_b: dict[str, Any] | None, pair: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """A's program discrepancies, then B's (renumbered), then the two-method difference when the readers disagree."""
+
+    out = []
+    for label, read in (("甲", read_a), ("乙", read_b)):
+        if not read or not (read.get("answer") or {}).get("buildings"):
+            continue
+        answer, checks = read["answer"], read.get("checks") or []
+        for d in discrepancies(answer, checks, agent_reader.findings(Path(read.get("_work") or "."), answer, checks) if read.get("_found") is None else read["_found"]):
+            d = dict(d, id=f"D{len(out) + 1}", reader=label, text=f"{label}的轮廓：" + d["text"])
+            out.append(d)
+    if pair and pair.get("difference_m2"):
+        a, b = pair["a"], pair["b"]
+        out.append({"id": f"D{len(out) + 1}", "kind": "two_methods", "building": pair["building"], "reader": "甲乙",
+                    "text": f"两种方法的结果不一致：甲 {a['area_m2']:,.2f} m²（{a['length_m']} × {a['width_m']} m），乙 {b['area_m2']:,.2f} m²（{b['length_m']} × {b['width_m']} m）；{pair['region']['description']}。",
+                    "at": (pair["region"]["pieces"] or [{}])[0].get("at"), "drawing_says": "—（两种读法之差，不是图上的数）",
+                    "ai_read": f"甲 {a['area_m2']:,.2f} m² / 乙 {b['area_m2']:,.2f} m²", "program": f"差异区域合计 {pair['difference_m2']:,.0f} m²：{pair['region']['description']}"})
+    return out
+
+
+def _pair_prompt(read_a: dict[str, Any], read_b: dict[str, Any] | None, a: tuple | None, b: tuple | None, b_face: str | None, disc: list[dict[str, Any]],
+                 geometry: dict[str, Any], region: dict[str, Any] | None, budget: int) -> str:
+    import sys
+
+    python = '"' + sys.executable + '"'
+    text = (PAIR_PROMPT_PATH.read_text(encoding="utf-8").replace("{PY}", python).replace("{MAX_TOOL_CALLS}", str(budget))
+            .replace("{RISK_CHECKLIST}", agent_reader.RISK_CHECKLIST_PATH.read_text(encoding="utf-8").strip()))
+    m = (read_a.get("answer") or {}).get("unit_m") or (read_b or {}).get("answer", {}).get("unit_m")
+    lines = ["", "## 你知道的", "", f"- 图纸单位：每图纸单位 {m} 米（--unit-m 用这个值）。"]
+    outlines = [c["outline"] for pair in (a, b) if pair for c in [pair[1]]]
+    if outlines:
+        xs = [p[0] for o in outlines for p in o]
+        ys = [p[1] for o in outlines for p in o]
+        pad = 0.1 * max(max(xs) - min(xs), max(ys) - min(ys))
+        lines.append(f"- 这栋楼的外包窗口（图纸坐标，已外扩 10%）：{min(xs) - pad:.0f} {min(ys) - pad:.0f} {max(xs) + pad:.0f} {max(ys) + pad:.0f}")
+    if a:
+        lines += _reader_words("甲", read_a, a[0], a[1], list(a[0].get("faces") or []))
+    else:
+        lines.append("- 甲：没有有效结果（没读出指定厂房，或没答完易错清单）。")
+    if b and read_b:
+        lines += _reader_words("乙", read_b, b[0], b[1], [b_face] if b_face else [])
+    else:
+        lines.append("- 乙：没有有效结果（没读出指定厂房，或没答完易错清单）。")
+    lines.append(f"- 程序按图层自己算的（不经 AI）：{_geometry_words(geometry)}")
+    if region:
+        lines.append(f"- 两条轮廓的差异区域（程序算的）：{region['description']}；合计 {region['difference_m2']:,.0f} m²。")
+    lines += ["", "## 矛盾清单（图上写的 / AI 读出的 / 程序复算的）", ""]
+    if not disc:
+        lines.append("（程序没有发现与图上数字的矛盾）")
+    for d in disc:
+        lines.append(f"{d['id']} [{KIND_CN.get(d['kind'], d['kind'])}] 楼「{d['building']}」：图上写的：{d['drawing_says']}；AI 读出的：{d['ai_read']}；程序复算的：{d['program']}。")
+    return text + "\n".join(lines) + "\n"
+
+
+def validate_decision(parsed: dict[str, Any] | None, disc: list[dict[str, Any]], a_ok: bool, b_ok: bool) -> dict[str, Any]:
+    """The reviewer's decision, forced into the four answers; a side that has no valid read cannot be adopted."""
+
+    p = parsed or {}
+    decision = p.get("decision") if p.get("decision") in DECISIONS else "undecided"
+    why = str(p.get("why") or "").strip()
+    if not parsed:
+        why = "复查没有回答"
+    elif p.get("decision") not in DECISIONS:
+        why = f"复查的回答不在四种之内（{p.get('decision')}）：" + why
+    if (decision == "adopt_a" and not a_ok) or (decision == "adopt_b" and not b_ok):
+        why = f"复查想采用{'甲' if decision == 'adopt_a' else '乙'}，但该读图没有有效结果：" + why
+        decision = "undecided"
+    return {"decision": decision, "why": why, "faces": [f for f in (p.get("faces") or []) if isinstance(f, str)] if decision == "both_wrong" else [],
+            "measured_by_agent": p.get("measured") if decision == "both_wrong" else None, "evidence": [str(e) for e in (p.get("evidence") or [])][:16],
+            "wrong_if": str(p.get("wrong_if") or "")[:300], "verdicts": validate_verdicts(p, disc), "notes": str(p.get("notes") or "")[:600]}
+
+
+KIND_CN["two_methods"] = "两法不一致"
+
+
+def adjudicate_pair(work_a: Path, read_a: dict[str, Any], read_b: dict[str, Any] | None, timeout_seconds: float = 1800.0) -> dict[str, Any]:
+    """Compare reader A (work_a) with reader B, ask the reviewer when they differ or a drawing number disagrees, and write the result state into read_a.
+
+    read_a comes back as the final read: `answer`/`checks` replaced when B's or the reviewer's outline is adopted (the old answer kept
+    as `answer_before_adjudication`), `adjudication` with the whole record, and `result_status` with the machine-readable state."""
+
+    import copy as _copy
+
+    from .constants import TWO_METHOD_AGREE_FRACTION
+
+    work_a = Path(work_a)
+    m = float((read_a.get("answer") or {}).get("unit_m") or ((read_b or {}).get("answer") or {}).get("unit_m") or 0)
+    if (work_a / agent_tools.FACES.name).is_file() and (read_a.get("answer") or {}).get("buildings"):
+        read_a["checks"] = agent_reader.verify(work_a, read_a["answer"])  # deterministic; the drawing checks need the index, the measurement only the faces
+    a, b = _designated_of(read_a), _designated_of(read_b)
+    record: dict[str, Any] = {"prompt_id": PAIR_PROMPT_ID, "prompt_sha256": hashlib.sha256(PAIR_PROMPT_PATH.read_bytes()).hexdigest(), "kind": "pair",
+                              "a_valid": bool(a), "b_valid": bool(b), "b_method_available": bool(((read_b or {}).get("answer") or {}).get("method_available", True)) if read_b else False}
+    summary = lambda pair: ({"area_m2": _measured(pair[1]).get("area_m2"), "length_m": _measured(pair[1]).get("length_m"), "width_m": _measured(pair[1]).get("width_m"),
+                             "outline": pair[1].get("outline"), "name": pair[0].get("name")} if pair else None)
+    status: dict[str, Any] = {"a": summary(a), "b": summary(b), "a_method": read_a.get("method", "wall"), "b_method": (read_b or {}).get("method"),
+                              "a_valid": bool(a), "b_valid": bool(b), "agree_tolerance": TWO_METHOD_AGREE_FRACTION}
+    if not a and not b:
+        record.update({"status": "no_building", "discrepancies": [], "verdicts": [], "overrides": [], "refused": [], "decision": None})
+        status.update({"status_code": "failed", "status_zh": STATUS_CN["failed"], "source": None, "source_zh": None,
+                       "why": "两种读法都没有读出指定厂房，或没有答完易错清单", "difference_m2": None, "difference_region": None, "drawing_matches": []})
+        read_a.update({"adjudication": record, "result_status": status})
+        return read_a
+    if not a and b and read_b:  # only B read the building: B's answer becomes this folder's answer (its face imported here)
+        read_a["answer_before_adjudication"] = read_a.get("answer")
+        fid = import_face(work_a, b[1]["outline"], m, "imported from reader B (structure)")
+        new = _copy.deepcopy(read_b["answer"])
+        for bb in new.get("buildings") or []:
+            if bb.get("designated"):
+                bb["faces"] = [fid]
+        read_a["answer"] = new
+        read_a["checks"] = agent_reader.verify(work_a, new)
+        a, b_face = _designated_of(dict(read_a, valid=True)), fid
+        only = "b"
+    else:
+        b_face = import_face(work_a, b[1]["outline"], m, "imported from reader B (structure)") if b else None
+        only = None if b else "a"
+    region = difference_region(a[1]["outline"], b[1]["outline"], m) if (a and b and only is None) else None
+    agree = bool(a and b and only is None and record["b_method_available"] and numbers_agree(_measured(a[1]), _measured(b[1])))
+    pair_info = {"building": a[0].get("name"), "a": _measured(a[1]), "b": _measured(b[1]), "region": region, "difference_m2": region["difference_m2"]} if region and not agree else None
+    read_a["_found"] = agent_reader.findings(work_a, read_a["answer"], read_a["checks"])
+    if read_b:
+        read_b["_found"] = read_b.get("_found") or (agent_reader.findings(Path(read_b["_work"]), read_b["answer"], read_b.get("checks") or []) if read_b.get("_work") else [])
+    disc = pair_discrepancies(read_a, read_b if only is None else None, pair_info)
+    read_a.pop("_found", None)
+    geometry = program_geometry(work_a, read_a.get("dxf") or (read_b or {}).get("dxf"), [c["outline"] for pair in (a, b) if pair for c in [pair[1]]], m)
+    record.update({"discrepancies": disc, "program_geometry": {k: geometry.get(k) for k in ("status", "message_zh", "axis", "wall") if k in geometry}, "difference_region": region})
+    budget = tool_budget(read_a["checks"], disc)
+    record["max_tool_calls"] = budget
+    needs_call = bool(disc)  # agreement without any drawing discrepancy: no reviewer call (target rule 5)
+    if not needs_call:
+        record.update({"status": "no_discrepancy", "decision": "adopt_a", "why": "两种方法一致，程序也没有发现与图上数字的矛盾" if agree else "只有一种方法有结果，程序没有发现与图上数字的矛盾",
+                       "verdicts": [], "overrides": [], "refused": [], "evidence": [], "wrong_if": ""})
+    else:
+        prompt = _pair_prompt(read_a, read_b if only is None else None, a, b if only is None else None, b_face, disc, geometry, region, budget)
+        done = agent_reader.run_prompt(work_a, prompt, tag="_adjudicate", timeout_seconds=timeout_seconds, answer_key="decision", model=ADJUDICATOR_MODEL)
+        dec = validate_decision(done["answer"], disc, bool(a), bool(b and only is None))
+        record.update({"status": "answered" if done["answer"] else "no_answer", **dec, "minutes": done["minutes"], "tokens_used": done["tokens_used"],
+                       "tool_calls": done["tool_calls"], "over_budget": (done["tool_calls"] or 0) > budget, "cost_usd_equivalent": done.get("cost_usd_equivalent"),
+                       "backend": agent_reader.AGENT_BACKEND, "model": done.get("model"), "overrides": [], "refused": []})
+    # apply the decision: which outline is the result, and what the program can say about it
+    source = "b" if only == "b" else "a"
+    final_answer, final_check = read_a["answer"], a[1]
+    decision = record["decision"]
+    if decision == "adopt_b" and b and only is None:
+        new = _copy.deepcopy(read_a["answer"])
+        for bb in new.get("buildings") or []:
+            if bb.get("designated"):
+                bb.update({"faces": [b_face], "area_m2": _measured(b[1]).get("area_m2"), "length_m": _measured(b[1]).get("length_m"), "width_m": _measured(b[1]).get("width_m"),
+                           "evidence": f"复查采用乙（{METHOD_CN.get(read_b.get('method'))}）的轮廓：{record.get('why')}", "method": read_b.get("method")})
+        final_answer, source = new, "b"
+    elif decision == "both_wrong":
+        faces_path = work_a / agent_tools.FACES.name
+        faces = json.loads(faces_path.read_text(encoding="utf-8")) if faces_path.is_file() else {}
+        ids = [f for f in record["faces"] if f in faces]
+        trial = _copy.deepcopy(read_a["answer"])
+        adopted = False
+        if ids and len(ids) == len(record["faces"]):
+            for bb in trial.get("buildings") or []:
+                if bb.get("designated"):
+                    got = agent_tools.measure_faces(ids, faces, m)
+                    if "error" not in got:
+                        bb.update({"faces": ids, "area_m2": got["area_m2"], "length_m": got["length_m"], "width_m": got["width_m"]})
+            trial_checks = agent_reader.verify(work_a, trial)
+            tc = next((c for c in trial_checks if c.get("designated") and c.get("outline")), None)
+            hits = drawing_matches(tc) if tc else []
+            if tc and hits:
+                final_answer, final_check, source, adopted = trial, tc, "reviewer", True
+                record["overrides"] = [{"building": tc.get("name"), "faces_after": ids, "before": _measured(a[1]), "after": _measured(tc), "matched": hits, "outline_before": a[1]["outline"]}]
+                record["applied"] = "复查重描采用：复测结果与图上写的数一致"
+            else:
+                record["applied"] = "复查重描未采用：复测结果与图上写的数对不上，转为待定；重描的面只作候选"
+                record["candidate"] = _candidate(ids, faces, m, []) if ids else None
+        else:
+            record["applied"] = "复查重描未采用：给出的面编号不存在，转为待定"
+        if not adopted:
+            record["decision"] = decision = "undecided"
+    if final_answer is not read_a["answer"]:
+        read_a["answer_before_adjudication"] = read_a["answer"]
+        read_a["answer"] = final_answer
+        read_a["checks"] = agent_reader.verify(work_a, final_answer)
+        final_check = next((c for c in read_a["checks"] if c.get("designated") and c.get("outline")), final_check)
+    read_a["remaining_feedback"] = agent_reader.feedback(work_a, read_a["answer"], read_a["checks"])
+    hits = drawing_matches(final_check)
+    if decision in ("adopt_a", "adopt_b", "both_wrong") and hits:
+        code = "matches_drawing"
+    elif agree:
+        code = "two_methods_agree"
+    else:
+        code = "undecided"
+    final_m = _measured(final_check)
+    status.update({"status_code": code, "status_zh": STATUS_CN[code], "source": source, "source_zh": SOURCE_CN[source], "decision": decision, "why": record.get("why"),
+                   "wrong_if": record.get("wrong_if"), "evidence": record.get("evidence"), "agree": agree, "drawing_matches": hits,
+                   "final": {"area_m2": final_m.get("area_m2"), "length_m": final_m.get("length_m"), "width_m": final_m.get("width_m")},
+                   "difference_m2": region["difference_m2"] if region else None, "difference_region": region["description"] if region else None,
+                   "difference_pieces": (region or {}).get("pieces", [])[:4], "program_geometry": _geometry_words(geometry),
+                   "risk_review": (read_a["answer"].get("risk_review") if source != "b" else (read_b or {}).get("answer", {}).get("risk_review")) or [],
+                   "undecided_numbers": ([{"source": "a", "source_zh": SOURCE_CN["a"], **{k: status["a"][k] for k in ("area_m2", "length_m", "width_m")}}] if a and status["a"] else [])
+                                        + ([{"source": "b", "source_zh": SOURCE_CN["b"], **{k: status["b"][k] for k in ("area_m2", "length_m", "width_m")}}] if b and status["b"] and only is None else [])
+                                        if code == "undecided" else []})
+    read_a.update({"adjudication": record, "result_status": status})
+    return read_a
+
+
+def ensure_pair(works: list[Path], force: bool = False, timeout_seconds: float = 1800.0) -> dict[str, Any]:
+    """Adjudicate the saved reads of the two methods (works[0] = A, works[1] = B if present); works[0]/agent_read.json is rewritten."""
+
+    path_a = Path(works[0]) / "agent_read.json"
+    read_a = json.loads(path_a.read_text(encoding="utf-8"))
+    if read_a.get("result_status") and not force:
+        return read_a["result_status"]
+    if force and read_a.get("answer_before_adjudication"):
+        read_a["answer"] = read_a.pop("answer_before_adjudication")
+        read_a.pop("adjudication", None)
+        read_a.pop("result_status", None)
+    read_b = None
+    if len(works) > 1 and (Path(works[1]) / "agent_read.json").is_file():
+        read_b = json.loads((Path(works[1]) / "agent_read.json").read_text(encoding="utf-8"))
+        read_b["_work"] = str(works[1])
+    read_a = adjudicate_pair(Path(works[0]), read_a, read_b, timeout_seconds)
+    path_a.write_text(json.dumps(read_a, ensure_ascii=False, indent=1), encoding="utf-8")
+    return read_a["result_status"]
+
+
+__all__ = ["adjudicate_pair", "adjudicate_read", "apply_verdicts", "difference_region", "discrepancies", "drawing_matches", "ensure", "ensure_pair",
+           "numbers_agree", "run", "validate_decision", "validate_verdicts"]

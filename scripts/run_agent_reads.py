@@ -78,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--designation")
     parser.add_argument("--only", type=int, help="do only run N (own directory and index); runs can then go in parallel")
+    parser.add_argument("--method", choices=sorted(agent_reader.PROMPTS), default="wall", help="the reader: wall (traces the outer wall) or structure (axis grid, columns, wall thickness)")
+    parser.add_argument("--no-adjudicate", action="store_true", help="skip the single-read adjudication (the two-method flow adjudicates the pair afterwards)")
     parser.add_argument("--compare", action="store_true", help="only compare the finished runs in --out")
     args = parser.parse_args(argv)
     out = Path(args.out).resolve()
@@ -85,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.only:  # one run in its own directory with its own index, so several can go at once
         work = out / f"run{args.only}"
         info = agent_reader.prepare(Path(args.dxf), work)
-        read = agent_reader.read_once(work, args.designation, info)
+        read = agent_reader.read_once(work, args.designation, info, method=args.method, adjudicate=False if args.no_adjudicate else None)
         read["dxf"] = str(args.dxf)
         (work / "agent_read.json").write_text(json.dumps(read, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"run {args.only}: {read['minutes']} min, {read['tokens_used']} tokens, parsed={read['answer_parsed']}, "

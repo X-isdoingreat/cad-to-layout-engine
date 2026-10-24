@@ -378,3 +378,34 @@ def summary_markdown(results: list[dict[str, Any]], unit: dict[str, Any]) -> str
 
 
 __all__ = ["StructureItems", "axis_grid", "collect_structure", "elevation_texts", "exterior_wall", "layer_role", "measure_views", "summary_markdown"]
+
+
+def measure_building(items: StructureItems, outlines: list[list[list[float]]], unit_m: float, dimensions: list[dict[str, Any]],
+                     margin_m: float | None = None) -> dict[str, Any]:
+    """The program's own axis-grid and exterior-wall measurement for ONE building (2026-10-23, cross-method reading).
+
+    The window is the readers' outlines' common bounding box widened by `margin_m` (default PROGRAM_GEOMETRY_MARGIN_M), so a
+    neighbouring building's axes do not join the grid as they do when a whole view is measured.  Numbers come back in metres;
+    this is the third, AI-free reference the reviewer AI sees beside the two readers."""
+
+    from .constants import PROGRAM_GEOMETRY_MARGIN_M
+
+    margin = (PROGRAM_GEOMETRY_MARGIN_M if margin_m is None else margin_m) / unit_m
+    points = [p for o in outlines for p in o]
+    if not points or not unit_m:
+        return {"status": "no_outline", "message_zh": "没有轮廓，无法定窗口"}
+    window = [min(p[0] for p in points) - margin, min(p[1] for p in points) - margin, max(p[0] for p in points) + margin, max(p[1] for p in points) + margin]
+    scale = unit_m * 1000.0
+    axis = axis_grid(items, window, scale, dimensions)
+    wall = exterior_wall(items, window, scale)
+    out: dict[str, Any] = {"window": [round(v, 3) for v in window], "margin_m": margin * unit_m, "axis": {"status": axis.get("status"), "message_zh": axis.get("message_zh")},
+                           "wall": {"status": wall.get("status"), "message_zh": wall.get("message_zh")}}
+    if axis.get("status") == "found":
+        out["axis"].update({"length_m": round(axis["length_mm"] / 1000.0, 2), "width_m": round(axis["width_mm"] / 1000.0, 2),
+                            "groups": [{"direction_deg": g.get("direction_deg"), "lines": g.get("line_count"), "first_label": g.get("first_label"), "last_label": g.get("last_label"),
+                                        "extent_m": round((g.get("extent_mm") or 0) / 1000.0, 2), "dimension_check": (g.get("dimension_check") or {}).get("status")}
+                                       for g in axis.get("groups", []) if g.get("extent_mm")]})
+    if wall.get("status") == "found":
+        out["wall"].update({"length_m": round(wall["length_mm"] / 1000.0, 2), "width_m": round(wall["width_mm"] / 1000.0, 2), "area_m2": wall["area_m2"],
+                            "rectangular": wall["rectangular"], "wall_thickness_mm": wall.get("wall_thickness_mm"), "outline": wall["outline"], "wall_layers": wall.get("wall_layers")})
+    return out

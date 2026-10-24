@@ -46,9 +46,9 @@ from .constants import (
 from .warehouse_geometry import UNIT_TO_MM, layer_role
 
 _LEXICON = json.loads((Path(__file__).with_name("lexicon_v1.json")).read_text(encoding="utf-8"))
-GUIDANCE_PATH = Path(__file__).with_name("type_guidance_v2.md")
+GUIDANCE_PATH = Path(__file__).with_name("type_guidance_v3.md")  # v3 (2026-10-23): every tile answers "wrong_if"; earlier judgements are weighed, not copied
 GUIDANCE = GUIDANCE_PATH.read_text(encoding="utf-8")
-GUIDANCE_ID = "type_guidance_v2"
+GUIDANCE_ID = "type_guidance_v3"
 TYPES = {"RACK", "STACKER", "PALLET_CONV_CHAIN", "PALLET_CONV_ROLLER", "CONVEYOR_UNKNOWN_SUBTYPE", "BOX_CONVEYOR",
          "BOX_LIFT", "ROBOT_ARM", "OTHER_EQUIPMENT", "COMPONENT", "NOT_EQUIPMENT", "UNSURE"}
 EQUIPMENT_TYPES = TYPES - {"COMPONENT", "NOT_EQUIPMENT", "UNSURE"}
@@ -257,16 +257,36 @@ def _nearby_texts(fam: dict[str, Any], texts: list[dict[str, Any]], scale: float
     return [t for t, _ in sorted(found.items(), key=lambda kv: kv[1])[:3]]
 
 
-def facts_line(tile_id: str, fam: dict[str, Any], nearby: list[str]) -> str:
+def facts_line(tile_id: str, fam: dict[str, Any], nearby: list[str], array: dict[str, Any] | None = None,
+               earlier: list[tuple[str, str]] | None = None) -> str:
+    """The printed facts of one tile; `array` is the family's largest regular row (how the block is laid out: racks come in
+    rows, conveyors end to end), `earlier` the (type, reason) pairs of judgements already given for this tile (extra votes)."""
+
     L, W = fam["size_mm"]
     parents = ", ".join(n for n, _ in fam["parents"].most_common(2)) or "none (top level)"
     children = ", ".join(n for n, _ in fam["children"].most_common(4)) or "none"
     views = len(fam["views"])
     inside = "; ".join(fam["texts_inside"][:3]) or "none"
     near = "; ".join(nearby) or "none"
+    extra = ""
+    if array:
+        extra += f"; arrangement: {array['count']} identical copies in one straight row, pitch {float(array['pitch_mm']):.0f} mm along the block's {array['along']}"
+    if earlier:
+        extra += "; earlier judgements: " + " | ".join(f"{t} ({r[:80]})" if r else t for t, r in earlier)
     return (f"{tile_id}: size {L:.0f} x {W:.0f} mm; occurs {len(fam['occurrences'])} times in {views} view(s), "
             f"{context_count(fam)} of them inside the surroundings picture; "
-            f"placed inside: {parents}; contains: {children}; texts inside: {inside}; texts nearby: {near}; block name: {fam['family'][:40]}")
+            f"placed inside: {parents}; contains: {children}; texts inside: {inside}; texts nearby: {near}{extra}; block name: {fam['family'][:40]}")
+
+
+def _majority(votes: list[str]) -> tuple[str | None, int]:
+    """The answer given by more than half of the votes (at least SPLIT_JUDGE_MAJORITY), or None."""
+
+    counts = Counter(votes)
+    if not counts:
+        return None, 0
+    top, n = counts.most_common(1)[0]
+    need = max(SPLIT_JUDGE_MAJORITY, len(votes) // 2 + 1)
+    return (top if n >= need else None), n
 
 
 def _context_window(fam: dict[str, Any]) -> list[float]:
@@ -355,16 +375,27 @@ def parse_tiles(text: str) -> dict[str, dict[str, Any]] | None:
     out = {}
     for row in value.get("tiles", []) if isinstance(value, dict) else []:
         if isinstance(row, dict) and row.get("type") in TYPES and isinstance(row.get("id"), str):
-            out[row["id"]] = {"type": row["type"], "name": str(row.get("name") or "")[:40], "reason": str(row.get("reason") or "")[:200]}
+            out[row["id"]] = {"type": row["type"], "name": str(row.get("name") or "")[:40], "reason": str(row.get("reason") or "")[:200],
+                              "wrong_if": str(row.get("wrong_if") or "")[:200]}
     return out
 
 
 def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[str], texts: list[dict[str, Any]], scale: float,
                  work_dir: Path, transport: Callable | None, allow_external: bool, replay: Path | None = None,
-                 all_boxes: list[list[float]] | None = None, start: int = 0) -> dict[str, dict[str, Any]]:
-    """Returns {family: {"status": agreed|disagreed|skipped, "type", "votes", "sheet", "tile_id"}}."""
+                 all_boxes: list[list[float]] | None = None, start: int = 0, arrays: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+    """Returns {family: {"status": agreed|disagreed|skipped, "type", "votes", "reasons", "wrong_if", "sheet", "tile_id"}}.
+
+    Every sheet is asked SPLIT_JUDGE_REPEATS times.  A family that occurs at least HIGH_COUNT_KIND_MIN times decides a large part
+    of the count, so when its votes do not reach a majority the sheet is asked TYPE_JUDGE_EXTRA_VOTES more times with the earlier
+    judgements' reasons printed (2026-10-23); the majority is then over all votes."""
+
+    from .constants import HIGH_COUNT_KIND_MIN, TYPE_JUDGE_EXTRA_VOTES
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    array_info: dict[str, dict[str, Any]] = {}
+    for a in arrays or []:
+        if a["count"] > array_info.get(a["family"], {}).get("count", 0):
+            array_info[a["family"]] = a
     surroundings = None
     if all_boxes:
         from shapely.geometry import box as shapely_box
@@ -385,12 +416,12 @@ def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[
             continue
         for tid, family in entry.get("tiles", []):
             rows = [(ask.get("parsed") or {}).get(tid) for ask in entry.get("asks", [])]
-            archived[family] = {"votes": [r["type"] for r in rows if r], "names": [(r or {}).get("name", "") for r in rows]}
+            archived[family] = {"votes": [r["type"] for r in rows if r], "names": [(r or {}).get("name", "") for r in rows],
+                                "reasons": [(r or {}).get("reason", "") for r in rows], "wrong_if": [(r or {}).get("wrong_if", "") for r in rows]}
     for family in [k for k in undecided if k in archived and archived[k]["votes"]]:
-        counts = Counter(archived[family]["votes"])
-        top, n = counts.most_common(1)[0]
-        results[family] = {"status": "agreed" if n >= SPLIT_JUDGE_MAJORITY else "disagreed", "type": top if n >= SPLIT_JUDGE_MAJORITY else None,
-                           "votes": archived[family]["votes"], "tile_id": "archive", "sheet": "replayed_per_family", "names": archived[family]["names"]}
+        top, n = _majority(archived[family]["votes"])
+        results[family] = {"status": "agreed" if top else "disagreed", "type": top, "votes": archived[family]["votes"], "tile_id": "archive", "sheet": "replayed_per_family",
+                           "names": archived[family]["names"], "reasons": archived[family]["reasons"], "wrong_if": archived[family]["wrong_if"]}
     undecided = [k for k in undecided if k not in results]
     ordered = sorted(undecided, key=lambda k: (-len(families[k]["occurrences"]), k))
     for sheet_index in range(0, len(ordered), TYPE_JUDGE_TILES_PER_SHEET):
@@ -401,40 +432,53 @@ def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[
         nearby = {tid: _nearby_texts(fam, texts, scale) for tid, fam in tiles}
         key = hashlib.sha256(json.dumps([guidance_sha, [[tid, fam["family"], [round(v) for v in fam["size_mm"]]] for tid, fam in tiles]], ensure_ascii=False).encode()).hexdigest()
         votes: dict[str, list[str]] = defaultdict(list)
-        asks = []
+        reasons: dict[str, list[str]] = defaultdict(list)
+        asks: list[dict[str, Any]] = []
+
+        def record(parsed: dict[str, dict[str, Any]] | None) -> None:
+            for tid, row in (parsed or {}).items():
+                votes[tid].append(row["type"])
+                reasons[tid].append(row.get("reason", ""))
+
+        def ask_once(ask_index: int, earlier: dict[str, list[tuple[str, str]]]) -> None:
+            order = list(tiles)
+            random.Random(ask_index).shuffle(order)  # real variation between asks: tile layout and fact order
+            image = sheet_dir / f"ask_{ask_index}.png"
+            image_sha = render_sheet(doc, order, image, surroundings)
+            facts = "\n".join(facts_line(tid, fam, nearby[tid], array_info.get(fam["family"]), earlier.get(tid)) for tid, fam in order)
+            prompt = GUIDANCE + "\n\nFacts per tile:\n" + facts
+            (sheet_dir / f"ask_{ask_index}_prompt.txt").write_text(prompt, encoding="utf-8")
+            call_dir = sheet_dir / f"ask_{ask_index}"
+            call_dir.mkdir(exist_ok=True)
+            raw = transport(prompt, image, call_dir)
+            parsed = parse_tiles(raw.get("text", ""))
+            asks.append({"ask": ask_index, "image_sha256": image_sha, "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                         "provider": raw.get("provider"), "model": raw.get("model"), "error": raw.get("error"), "raw_text": raw.get("text", ""), "parsed": parsed,
+                         "with_earlier_judgements": bool(earlier)})
+            record(parsed)
+
         if key in saved:
             asks = saved[key]["asks"]
             for ask in asks:
-                for tid, row in (ask.get("parsed") or {}).items():
-                    votes[tid].append(row["type"])
+                record(ask.get("parsed"))
         elif transport is not None and allow_external:
             for ask_index in range(1, SPLIT_JUDGE_REPEATS + 1):
-                order = list(tiles)
-                random.Random(ask_index).shuffle(order)  # real variation between asks: tile layout and fact order
-                image = sheet_dir / f"ask_{ask_index}.png"
-                image_sha = render_sheet(doc, order, image, surroundings)
-                facts = "\n".join(facts_line(tid, fam, nearby[tid]) for tid, fam in order)
-                prompt = GUIDANCE + "\n\nFacts per tile:\n" + facts
-                (sheet_dir / f"ask_{ask_index}_prompt.txt").write_text(prompt, encoding="utf-8")
-                call_dir = sheet_dir / f"ask_{ask_index}"
-                call_dir.mkdir(exist_ok=True)
-                raw = transport(prompt, image, call_dir)
-                parsed = parse_tiles(raw.get("text", ""))
-                asks.append({"ask": ask_index, "image_sha256": image_sha, "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-                             "provider": raw.get("provider"), "model": raw.get("model"), "error": raw.get("error"), "raw_text": raw.get("text", ""), "parsed": parsed})
-                for tid, row in (parsed or {}).items():
-                    votes[tid].append(row["type"])
+                ask_once(ask_index, {})
+            # a high-count family without a majority: more votes, with the earlier judgements and their reasons shown
+            if any(len(fam["occurrences"]) >= HIGH_COUNT_KIND_MIN and _majority(votes[tid])[0] is None for tid, fam in tiles):
+                for extra in range(1, TYPE_JUDGE_EXTRA_VOTES + 1):
+                    earlier = {tid: list(zip(votes[tid], reasons[tid])) for tid, _ in tiles if votes[tid]}
+                    ask_once(SPLIT_JUDGE_REPEATS + extra, earlier)
             saved[key] = {"tiles": [[tid, fam["family"]] for tid, fam in tiles], "asks": asks, "guidance_id": GUIDANCE_ID,
                           "guidance_sha256": hashlib.sha256(GUIDANCE.encode("utf-8")).hexdigest()}
         for tid, fam in tiles:
-            counts = Counter(votes.get(tid, []))
-            if not counts:
+            if not votes.get(tid):
                 results[fam["family"]] = {"status": "skipped", "tile_id": tid, "sheet": sheet_dir.name, "votes": []}
                 continue
-            top, n = counts.most_common(1)[0]
-            results[fam["family"]] = {"status": "agreed" if n >= SPLIT_JUDGE_MAJORITY else "disagreed", "type": top if n >= SPLIT_JUDGE_MAJORITY else None,
-                                      "votes": votes[tid], "tile_id": tid, "sheet": sheet_dir.name,
-                                      "names": [(ask.get("parsed") or {}).get(tid, {}).get("name", "") for ask in asks]}
+            top, n = _majority(votes[tid])
+            results[fam["family"]] = {"status": "agreed" if top else "disagreed", "type": top, "votes": votes[tid], "reasons": reasons[tid], "tile_id": tid, "sheet": sheet_dir.name,
+                                      "names": [(ask.get("parsed") or {}).get(tid, {}).get("name", "") for ask in asks],
+                                      "wrong_if": [(ask.get("parsed") or {}).get(tid, {}).get("wrong_if", "") for ask in asks]}
         # saved after every sheet, so an interrupted run can be resumed from its own archive
         (work_dir / "type_judge_archive.json").write_text(json.dumps(saved, ensure_ascii=False, indent=1), encoding="utf-8")
     (work_dir / "type_judge_archive.json").write_text(json.dumps(saved, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -565,21 +609,24 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
             if parts:
                 continue
             break
-        judged = judge_shapes(doc, families, ready, inventory["texts"], scale, work_dir / "type_judge", transport, allow_external, replay, all_boxes, start)
+        judged = judge_shapes(doc, families, ready, inventory["texts"], scale, work_dir / "type_judge", transport, allow_external, replay, all_boxes, start, arrays=arrays)
         start += math.ceil(len(ready) / TYPE_JUDGE_TILES_PER_SHEET) * TYPE_JUDGE_TILES_PER_SHEET
         pending -= set(ready)
         for key, j in judged.items():
+            # what the judges said would make their answer wrong, kept with the decision (target rule 4): the sentence given with the adopted type first
+            wrong = [w for w, t in zip(j.get("wrong_if") or [], j.get("votes") or []) if w and t == j.get("type")] + [w for w in j.get("wrong_if") or [] if w]
+            extra = {"reasons": j.get("reasons", []), "wrong_if": wrong[0] if wrong else "", "wrong_if_all": list(dict.fromkeys(wrong))[:5]}
             if j["status"] == "agreed" and j["type"] == "UNSURE":
                 decisions[key] = {"type": "UNRECOGNISED", "basis": "llm_shape", "stage": "llm", "reason": "judge_unsure", "votes": j["votes"],
-                                  "tile": [j["sheet"], j["tile_id"]]}
+                                  "tile": [j["sheet"], j["tile_id"]], **extra}
                 stage_counts["llm_unsure"] += 1
             elif j["status"] == "agreed":
                 decisions[key] = {"type": j["type"], "basis": "llm_shape", "stage": "llm", "votes": j["votes"], "tile": [j["sheet"], j["tile_id"]],
-                                  "name": next((n for n in j.get("names", []) if n), "")}
+                                  "name": next((n for n in j.get("names", []) if n), ""), **extra}
                 stage_counts["llm_agreed"] += 1
             else:
                 decisions[key] = {"type": "UNRECOGNISED", "basis": "llm_shape", "stage": "llm", "reason": f"judge_{j['status']}", "votes": j.get("votes", []),
-                                  "tile": [j["sheet"], j["tile_id"]]}
+                                  "tile": [j["sheet"], j["tile_id"]], **extra}
                 stage_counts[f"llm_{j['status']}"] += 1
     for key in sorted(pending):  # cannot happen in a block hierarchy; kept visible if it ever does
         decisions[key] = {"type": "UNRECOGNISED", "basis": "geometry", "stage": "rules", "reason": "not_reached_by_the_top_down_judgement"}
@@ -726,7 +773,7 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
     summary: dict[str, dict[str, dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: {"text_or_geometry": 0, "llm_shape": 0}))
     for r in records:
         summary[r["view_id"]][r["type"]]["llm_shape" if r["basis"] == "llm_shape" else "text_or_geometry"] += 1
-    unrecognised = [{"family": k, "occurrences": len(families[k]["occurrences"]), "size_mm": [round(v) for v in families[k]["size_mm"]], **{x: decisions[k].get(x) for x in ("reason", "votes", "rejected_type")}}
+    unrecognised = [{"family": k, "occurrences": len(families[k]["occurrences"]), "size_mm": [round(v) for v in families[k]["size_mm"]], **{x: decisions[k].get(x) for x in ("reason", "votes", "rejected_type", "wrong_if")}}
                     for k in sorted(unrecognised_families)]
     return {
         "status": "done",
@@ -805,7 +852,8 @@ def equipment_markdown(result: dict[str, Any], views: list[dict[str, Any]]) -> s
             lines.append(f"- {view_id}：{key[:30]}（{drawn_zh.get(drawn_as, drawn_as)}）{n} 个")
     lines += ["", f"未识别的图块种类：{len(result['unrecognised'])}（按出现次数排序，前 15）：", ""]
     for u in result["unrecognised"][:15]:
-        lines.append(f"- {u['family'][:30]}：{u['occurrences']} 次，{u['size_mm'][0]}×{u['size_mm'][1]} mm，原因 {u.get('reason')}，投票 {u.get('votes')}")
+        lines.append(f"- {u['family'][:30]}：{u['occurrences']} 次，{u['size_mm'][0]}×{u['size_mm'][1]} mm，原因 {u.get('reason')}，投票 {u.get('votes')}"
+                     + (f"，判官说会判错的情况：{u['wrong_if']}" if u.get("wrong_if") else ""))
     return "\n".join(lines) + "\n"
 
 

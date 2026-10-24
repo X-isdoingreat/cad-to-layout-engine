@@ -200,3 +200,15 @@ REPEAT_ANCHORS = 8
 REPEAT_MAX_FOLLOW_UPS = 3
 # A group whose places mostly (this share) fall on equipment already counted from blocks is not counted twice.
 REPEAT_ALREADY_COUNTED_SHARE = 0.5
+
+# Cross-method reading (2026-10-23, acceptance target cross_method_reading_20261023): two readers by different methods,
+# a reviewer AI over both, machine-readable result states.  Two readings agree when area, length and width all differ by
+# at most TWO_METHOD_AGREE_FRACTION (assistant default, same as the audit tolerance, awaiting the CEO).  The program's own
+# geometry for one building is measured in a window round the readers' outlines widened by PROGRAM_GEOMETRY_MARGIN_M.
+TWO_METHOD_AGREE_FRACTION = 0.01
+PROGRAM_GEOMETRY_MARGIN_M = 15.0
+# Equipment type judge: a block family that occurs at least HIGH_COUNT_KIND_MIN times decides a large part of the count, so when
+# its first SPLIT_JUDGE_REPEATS votes disagree the sheet is asked TYPE_JUDGE_EXTRA_VOTES more times, with the earlier
+# judgements' reasons shown; the majority is then over all votes.
+HIGH_COUNT_KIND_MIN = 50
+TYPE_JUDGE_EXTRA_VOTES = 2

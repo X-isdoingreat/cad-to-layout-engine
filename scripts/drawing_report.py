@@ -132,12 +132,21 @@ def area_page(pdf: Any, pyplot: Any, area: Path) -> list[float] | None:
     else:
         src = next((x for x in (read.get("answer") or {}).get("buildings", []) if x.get("name") == b["name"]), {})
         floors = other_floors(read.get("answer") or {}, src)
+        other = [n for n in (b.get("undecided_numbers") or []) if n.get("source") != b.get("source")]
+        risks = [r for r in (b.get("risk_review") or []) if isinstance(r, dict) and float(r.get("if_wrong_effect_m2") or 0) > 0][:3]
+        state = ([(f"状态：{b['status_zh']}；采用：{b.get('source_zh') or ''}；人工复查：可选", 10.5, "normal")] if b.get("status_code") else
+                 [(f"识别方式：{SOURCE_ZH.get(b['outline_source'], b['outline_source'])}；状态：{STATUS_ZH.get(b['status'], b['status'])}", 10.5, "normal")])
         _words(figure, "一、厂房尺寸", [
             (b["name"][:40], 12, "bold"), ("", 0, ""),
             (f"总面积 {b['area_m2']:,.0f} 平方米", 16, "bold"),
-            (f"长 {b.get('length_m', 0):.1f} 米 × 宽 {b.get('width_m', 0):.1f} 米", 14, "normal"), ("", 0, ""),
+            (f"长 {b.get('length_m', 0):.1f} 米 × 宽 {b.get('width_m', 0):.1f} 米", 14, "normal"),
+            *[(f"另一种方法（{n.get('source_zh')}）：{float(n.get('area_m2') or 0):,.0f} 平方米，长 {float(n.get('length_m') or 0):.1f} × 宽 {float(n.get('width_m') or 0):.1f} 米", 11, "normal") for n in other],
+            *([(f"差在：{str(b.get('difference_region'))[:70]}", 10, "normal")] if other and b.get("difference_region") else []),
+            ("", 0, ""),
             ("图中红线为系统识别的厂房外墙轮廓，叠加在客户原图上。", 10.5, "normal"),
-            (f"识别方式：{SOURCE_ZH.get(b['outline_source'], b['outline_source'])}；状态：{STATUS_ZH.get(b['status'], b['status'])}", 10.5, "normal"),
+            *state,
+            *([(f"复查说明：{str(b.get('why'))[:70]}", 9.5, "normal")] if b.get("why") else []),
+            *([(f"可能错在：{str(r.get('id'))} {str(r.get('what_seen'))[:40]}（若错约 {float(r.get('if_wrong_effect_m2') or 0):,.0f} m²）", 9, "normal") for r in risks]),
             ("净高：需客户提供。", 10.5, "normal"),
             *([(f"图纸另有其他楼层，未计入：{'、'.join(floors)[:60]}", 10.5, "normal")] if floors else []),
             ("", 0, ""), ("计算口径：按外墙外边线围成的占地面积；多层建筑只计指定楼层（默认首层）。", 9, "normal")])
@@ -427,7 +436,8 @@ def conclusion(pyplot: Any, drawing: str, area: dict[str, Any] | None, equipment
     y -= 0.07
     rows = []
     if area:
-        rows.append(("厂房", f"{area['name'][:20]}：总面积 {area['area_m2']:,.0f} 平方米，长 {area.get('length_m', 0):.1f} × 宽 {area.get('width_m', 0):.1f} 米"))
+        rows.append(("厂房", f"{area['name'][:20]}：总面积 {area['area_m2']:,.0f} 平方米，长 {area.get('length_m', 0):.1f} × 宽 {area.get('width_m', 0):.1f} 米"
+                     + (f"；状态：{area['status_zh']}" if area.get("status_zh") else "")))
     if equipment.get("counts"):
         main = "、".join(f"{label(t)} {n:,} {unit(t)}" for t, n in equipment["counts"].most_common())[:80]
         rows.append(("设备", f"{equipment['floor']}：{main}（按设备图块统计）"
@@ -445,7 +455,8 @@ def conclusion(pyplot: Any, drawing: str, area: dict[str, Any] | None, equipment
     for r in equipment.get("repeat") or []:
         rows.append(("重复图形", f"{r['floor'][:14]}：{r['guess']} {r['count']:,} 处（{r['id']}，系统按重复图形统计，每处算几{r['unit'] if r['unit'] != '处' else '台'}待您确认）"
                      + (f"；另有 {len(r['questions'])} 组拿不准（{'、'.join(r['questions'])}），未计入" if r["questions"] else "")))
-    rows.append(("状态", "以上为系统识别结果，尚未经人工核对。"))
+    rows.append(("状态", "厂房面积由两种独立方法读出并经复查 AI 核对（状态见上）；设备为系统识别结果。人工复查为可选步骤。" if area and area.get("status_code")
+                 else "以上为系统识别结果，尚未经人工核对。"))
     if equipment.get("questions"):
         q = [x for x in equipment["questions"] if x.startswith("E")]
         rq = [x for x in equipment["questions"] if x.startswith("R")]

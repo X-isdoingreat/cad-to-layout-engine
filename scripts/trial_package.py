@@ -50,29 +50,33 @@ def run(args: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     customer = Path(args.dwg).resolve()
     reads = out / "reads"
-    reuse = args.reuse_reads and all((reads / f"run{n}" / "agent_read.json").is_file() for n in range(1, args.reads + 1))
+    # Two readers by different methods (target cross_method_reading_20261023): run1 = wall (traces the outer wall), run2 = structure
+    # (axis grid, columns, wall thickness), one after another - never two AI sessions at once - and blind to each other.
+    methods = [s.strip() for s in (args.methods or ("wall,structure" if args.reads >= 2 else "wall")).split(",") if s.strip()]
+    reuse = args.reuse_reads and all((reads / f"run{n}" / "agent_read.json").is_file() for n in range(1, len(methods) + 1))
     dxf = out / "source.dxf" if reuse else to_dxf(customer, out, args.timeout)
     env = dict(os.environ, CTLE_AGENT=os.environ.get("CTLE_AGENT", "claude"), PYTHONPATH=str(ROOT))  # the AI backend is chosen by the caller
-    procs = []
-    for n in ([] if reuse else range(1, args.reads + 1)):
-        cmd = [sys.executable, "-X", "utf8", "-m", "scripts.run_agent_reads", "--dxf", str(dxf), "--out", str(reads), "--only", str(n)]
+    for n, method in ([] if reuse else list(enumerate(methods, 1))):
+        cmd = [sys.executable, "-X", "utf8", "-m", "scripts.run_agent_reads", "--dxf", str(dxf), "--out", str(reads), "--only", str(n), "--method", method, "--no-adjudicate"]
         if args.designation:
             cmd += ["--designation", args.designation]
-        log = open(out / f"read_{n}.log", "w", encoding="utf-8")
-        procs.append((subprocess.Popen(cmd, cwd=str(ROOT), env=env, stdout=log, stderr=subprocess.STDOUT), log))
-    for proc, log in procs:
-        proc.wait()
-        log.close()
-    works = [reads / f"run{n}" for n in range(1, args.reads + 1) if (reads / f"run{n}" / "agent_read.json").is_file()]
+        with open(out / f"read_{n}.log", "w", encoding="utf-8") as log:
+            subprocess.run(cmd, cwd=str(ROOT), env=env, stdout=log, stderr=subprocess.STDOUT)
+    works = [reads / f"run{n}" for n in range(1, len(methods) + 1) if (reads / f"run{n}" / "agent_read.json").is_file()]
     if not works:
-        raise SystemExit("no read finished; see read_*.log")
-    works, dropped = rank_reads(works)
-    if not args.skip_adjudication:  # a read saved before the step existed gets it now (one agent call, only when there is a discrepancy)
+        result_json(out, customer, args.designation, [], None, failed="没有一次读图完成（AI 调用失败或超时），见 read_*.log")
+        raise SystemExit(3)
+    dropped: list[dict[str, Any]] = []
+    status: dict[str, Any] = {}
+    if not args.skip_adjudication:  # the reviewer AI over both reads (no call when they agree and no drawing number disagrees)
         from cad_to_layout.zero_manual import adjudicator
 
-        verdict = adjudicator.ensure(works[0], force=args.re_adjudicate, timeout_seconds=args.timeout * 2)
-        print(json.dumps({"adjudication": verdict.get("status"), "discrepancies": len(verdict.get("discrepancies") or []),
-                          "overrides": len(verdict.get("overrides") or []), "tokens_used": verdict.get("tokens_used")}, ensure_ascii=False), flush=True)
+        status = adjudicator.ensure_pair(works, force=args.re_adjudicate, timeout_seconds=args.timeout * 2)
+        print(json.dumps({"status": status.get("status_code"), "decision": status.get("decision"), "source": status.get("source"),
+                          "difference_m2": status.get("difference_m2"), "a_valid": status.get("a_valid"), "b_valid": status.get("b_valid")}, ensure_ascii=False), flush=True)
+        if status.get("status_code") == "failed":
+            result_json(out, customer, args.designation, works, None, failed=status.get("why") or "读不出")
+            raise SystemExit(3)
     issue_dir = out / "issue"
     confirm_cad.main(["issue", "--work", str(works[0]), *(["--other-work", *map(str, works[1:])] if works[1:] else []),
                       "--source-dxf", str(dxf), "--customer-dwg", str(customer), "--out", str(issue_dir)])
@@ -91,8 +95,53 @@ def run(args: argparse.Namespace) -> int:
                                                   "reads_not_compared": dropped,
                                                   "issue": str(issue_dir), "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat()},
                                                  ensure_ascii=False, indent=1), encoding="utf-8")
-    print(json.dumps({"send_folder": str(send), "reads": len(works)}, ensure_ascii=False))
+    result_json(out, customer, args.designation, works, preview, send=send)
+    print(json.dumps({"send_folder": str(send), "reads": len(works), "status": status.get("status_code")}, ensure_ascii=False))
     return 0
+
+
+STEP_CN = {"wall": "读图甲（沿外墙描）", "structure": "读图乙（按结构推）"}
+
+
+def ai_calls(works: list[Path]) -> list[dict[str, Any]]:
+    """Every AI call of this drawing's area read with its use and cost: the readers (with their revision rounds) and the reviewer."""
+
+    calls = []
+    for w in works:
+        path = Path(w) / "agent_read.json"
+        if not path.is_file():
+            continue
+        r = json.loads(path.read_text(encoding="utf-8"))
+        calls.append({"step": STEP_CN.get(r.get("method"), "读图"), "method": r.get("method"), "backend": r.get("backend"), "model": r.get("model"), "minutes": r.get("minutes"),
+                      "tokens_used": r.get("tokens_used"), "cost_usd_equivalent": r.get("cost_usd_equivalent"), "rounds": 1 + len(r.get("revisions") or []),
+                      "valid": r.get("valid"), "returncode": r.get("returncode")})
+        adj = r.get("adjudication") or {}
+        if adj.get("status") in {"answered", "no_answer"}:
+            calls.append({"step": "复查 AI", "backend": adj.get("backend"), "model": adj.get("model"), "minutes": adj.get("minutes"), "tokens_used": adj.get("tokens_used"),
+                          "cost_usd_equivalent": adj.get("cost_usd_equivalent"), "tool_calls": adj.get("tool_calls"), "decision": adj.get("decision")})
+    return calls
+
+
+def result_json(out: Path, customer: Path, designation: str | None, works: list[Path], preview: dict[str, Any] | None, send: Path | None = None,
+                failed: str | None = None) -> Path:
+    """The machine-readable result of the area read (`结果.json`): the building's numbers with their status and source, both methods'
+    numbers, the difference between them, every AI call's use and cost.  A failed run says so and carries no numbers."""
+
+    calls = ai_calls(works)
+    cost = sum(float(c.get("cost_usd_equivalent") or 0) for c in calls)
+    b = next((x for x in (preview or {}).get("buildings") or [] if x.get("designated")), None) if preview else None
+    body: dict[str, Any] = {"schema": "ctle-area-result-1.0", "drawing": customer.name, "designation": designation,
+                            "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "ai_calls": calls, "cost_usd_equivalent": round(cost, 4)}
+    if failed or b is None:
+        body.update({"status_code": "failed", "status_zh": "读不出", "why": failed or "没有读出指定厂房", "building": None})
+    else:
+        keys = ("name", "area_m2", "length_m", "width_m", "status_code", "status_zh", "source", "source_zh", "decision", "why", "wrong_if", "undecided_numbers",
+                "difference_m2", "difference_region", "drawing_matches", "methods", "risk_review", "outline_source", "human_review")
+        body.update({"status_code": b.get("status_code") or "undecided", "status_zh": b.get("status_zh") or "待定", "building": {k: b.get(k) for k in keys},
+                     "human_review": {"optional": True, "package": str(send) if send else None}})
+    path = out / "结果.json"
+    path.write_text(json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+    return path
 
 
 def rank_reads(works: list[Path]) -> tuple[list[Path], list[dict[str, Any]]]:
@@ -532,7 +581,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dwg", required=True)
     p.add_argument("--designation")
     p.add_argument("--out", required=True)
-    p.add_argument("--reads", type=int, default=1, help="reads per drawing (2026-10-10: one; the reviewer checks the whole outline anyway)")
+    p.add_argument("--reads", type=int, default=2, help="2 (default): the two methods, wall then structure; 1: the wall reader alone")
+    p.add_argument("--methods", help="comma-separated reader methods in run order, e.g. wall,structure (overrides --reads)")
     p.add_argument("--reuse-reads", action="store_true", help="keep finished reads and only rebuild the marks and the package")
     p.add_argument("--skip-adjudication", action="store_true", help="do not run the adjudication step on a read that lacks it (no agent call)")
     p.add_argument("--re-adjudicate", action="store_true", help="run the adjudication step again on the kept read (one agent call)")

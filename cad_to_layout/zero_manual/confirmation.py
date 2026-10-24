@@ -61,7 +61,7 @@ QUESTIONS = {
     "height": "这个高度是不是指定厂房的净高？（要＝是；不要＝不是或不确定）",
     "zone_category": "这个区域看不出是存储还是作业：把编号移到「CTLE_类别_存储」「CTLE_类别_作业」或「CTLE_类别_其他」层。",
 }
-NOT_FOR_PEOPLE = {"bookkeeping", "columns", "reads_columns", "building_not_reported", "no_building"}  # trial scope: no columns, no other buildings  # findings about the agent's own record keeping; they change no number
+NOT_FOR_PEOPLE = {"bookkeeping", "columns", "reads_columns", "building_not_reported", "no_building", "risk_review"}  # trial scope: no columns, no other buildings  # findings about the agent's own record keeping; they change no number
 ADJUDICATED_KINDS = ("stated_area", "dimension", "notches", "remeasure")  # marks the adjudication step (adjudicator.py) gives a verdict on
 VERDICT_CN = {"outline_right": "认为轮廓对", "outline_wrong": "认为轮廓错", "cannot_decide": "没把握，交人"}
 NOTE_MAX_CHARS = 240  # the verdict's reason in a CAD label and on the page; the full text stays in items.json
@@ -610,6 +610,18 @@ def apply(read: dict[str, Any], items: list[dict[str, Any]], issued: dict[str, A
     changed = [h for h, layer in issued["entities"].items() if returned["entities"].get(h) != layer]
     added_entities = [h for h in returned["entities"] if h not in issued["entities"]]
     unmarked = [b["name"] for b in buildings if "人工修改（未标记处）" in (b.get("outline_source"), b.get("columns_source"))]
+    rs = read.get("result_status") or {}
+    if rs:  # the machine-readable state of the two-method read (target cross_method_reading_20261023); a human edit leaves the four states
+        for b in buildings:
+            if not b["designated"]:
+                continue
+            b.update({"status_code": rs.get("status_code"), "status_zh": rs.get("status_zh"), "source": rs.get("source"), "source_zh": rs.get("source_zh"),
+                      "decision": rs.get("decision"), "why": rs.get("why"), "wrong_if": rs.get("wrong_if"), "undecided_numbers": rs.get("undecided_numbers") or [],
+                      "difference_m2": rs.get("difference_m2"), "difference_region": rs.get("difference_region"), "drawing_matches": rs.get("drawing_matches") or [],
+                      "methods": {"a": rs.get("a"), "b": rs.get("b"), "a_method": rs.get("a_method"), "b_method": rs.get("b_method"), "a_valid": rs.get("a_valid"), "b_valid": rs.get("b_valid")},
+                      "risk_review": rs.get("risk_review") or [], "human_review": "可选"})
+            if b["outline_source"] in {"人工修改", "人工修改（未标记处）"} or (b["outline_source"] == "人工确认" and b["name"] in human_for):
+                b.update({"status_code": "human_edited", "status_zh": "人工修改（不在机器状态内）", "source": "human", "source_zh": "人工修改"})
     if TRIAL_SCOPE:
         buildings = [b for b in buildings if b["designated"] or b["name"].startswith("人工补描")]
     return {"buildings": sorted(buildings, key=lambda b: (not b["designated"], b["name"])), "zones": zones, "views": views, "decisions": decisions,

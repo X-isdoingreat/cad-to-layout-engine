@@ -83,9 +83,11 @@ def items_of(equipment: dict[str, Any], views: dict[str, Any]) -> list[dict[str,
         first = records[0]
         sizes = sorted((r["length_mm"], r["width_mm"]) for r in records)
         per_view = Counter(r["view_id"] for r in records)
-        votes = ((equipment["families"].get(family) or {}).get("decision") or {}).get("votes") or []
+        decision = (equipment["families"].get(family) or {}).get("decision") or {}
+        votes = decision.get("votes") or []
         items.append({"family": family, "type": first["type"], "type_zh": first["type_zh"], "name": first.get("name") or "",
                       "basis": "图上文字" if first["basis"] == "text" else (f"AI 看图（{Counter(votes).most_common(1)[0][1]}/{len(votes)} 次一致）" if votes else "AI 看图"),
+                      "wrong_if": decision.get("wrong_if") or "",
                       "drawn_as": first.get("drawn_as", "block"), "sample_ref": first["ref"],
                       "count": sum(n for v, n in per_view.items() if v not in copies), "per_view": dict(per_view),
                       "size_mm": [round(v) for v in sizes[len(sizes) // 2]], "warehouse": first["type"] in WAREHOUSE_TYPES})
@@ -383,7 +385,7 @@ OTHER_EQUIPMENT 其他物流设备（穿梭车、四向车、AGV、叉车、工�
 NOT_EQUIPMENT 不是设备（柱子、墙、门窗、楼梯、灯、标注、编号圈、托盘或货物轮廓、地面标记、区域框）
 COMPONENT 设备的零件（立柱、横梁、电机、传感器、护栏）
 UNSURE 实在看不出
-不要用工具，只看图和文字。只输出 JSON：{"type": "...", "name": "...", "reason": "一句话"}"""
+不要用工具，只看图和文字。只输出 JSON：{"type": "...", "name": "...", "reason": "一句话", "wrong_if": "什么情况下这个判断是错的，一句话"}"""
 
 
 def _family_occurrence(inventory: dict[str, Any], family: str) -> dict[str, Any] | None:
@@ -451,7 +453,7 @@ def second_look(run: Path, items: list[dict[str, Any]], inventory: dict[str, Any
                 raw = transport(prompt, image, call)
                 value = _json_from(raw.get("text", "")) or {}
                 asks.append({"type": value.get("type"), "name": str(value.get("name") or "")[:30], "reason": str(value.get("reason") or "")[:120],
-                             "provider": raw.get("provider"), "model": raw.get("model")})
+                             "wrong_if": str(value.get("wrong_if") or "")[:120], "provider": raw.get("provider"), "model": raw.get("model")})
             archive[family] = {"asks": asks, "prompt_sha": __import__("hashlib").sha256(SECOND_LOOK_GUIDANCE.encode()).hexdigest()}
             archive_path.write_text(json.dumps(archive, ensure_ascii=False, indent=1), encoding="utf-8")
         asks = archive[family]["asks"]
@@ -460,7 +462,8 @@ def second_look(run: Path, items: list[dict[str, Any]], inventory: dict[str, Any
             top, n = votes.most_common(1)[0]
             name = next((a["name"] for a in asks if a["type"] == top and a["name"]), "")
             out[it["id"]] = {"type": top if n >= SPLIT_JUDGE_MAJORITY else "UNSURE", "name": name, "votes": f"{n}/{len(asks)}",
-                             "reason": next((a["reason"] for a in asks if a["type"] == top), "")}
+                             "reason": next((a["reason"] for a in asks if a["type"] == top), ""),
+                             "wrong_if": next((a.get("wrong_if", "") for a in asks if a["type"] == top and a.get("wrong_if")), "")}
     return out
 
 
@@ -603,7 +606,7 @@ ROBOT_ARM 机械臂
 OTHER_EQUIPMENT 其他物流设备（在 name 写名称）
 NOT_EQUIPMENT 不是设备（柱网、墙、门窗、楼梯、表格、图框、标注、地面标记）
 UNSURE 实在看不出
-不要用工具，只看图和文字。只输出 JSON：{"type": "...", "name": "...", "reason": "一句话"}"""
+不要用工具，只看图和文字。只输出 JSON：{"type": "...", "name": "...", "reason": "一句话", "wrong_if": "什么情况下这个判断是错的，一句话"}"""
 
 
 def _record_box(r: dict[str, Any]) -> list[float]:
