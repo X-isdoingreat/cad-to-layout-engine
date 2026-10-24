@@ -212,3 +212,6 @@ PROGRAM_GEOMETRY_MARGIN_M = 15.0
 # judgements' reasons shown; the majority is then over all votes.
 HIGH_COUNT_KIND_MIN = 50
 TYPE_JUDGE_EXTRA_VOTES = 2
+# A designated point within this distance of a reader's outline edge lies on a wall, maybe one two buildings or spans
+# share: which side was meant is not stated, so two readers taking different sides is not decided by the reviewer.
+DESIGNATION_ON_WALL_M = 2.0

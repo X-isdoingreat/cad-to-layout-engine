@@ -146,6 +146,7 @@ def area_page(pdf: Any, pyplot: Any, area: Path) -> list[float] | None:
             ("图中红线为系统识别的厂房外墙轮廓，叠加在客户原图上。", 10.5, "normal"),
             *state,
             *([(f"复查说明：{str(b.get('why'))[:70]}", 9.5, "normal")] if b.get("why") else []),
+            *([(f"指定含糊：{str(b.get('designation_note'))[:70]}", 9.5, "normal")] if b.get("designation_note") else []),
             *([(f"可能错在：{str(r.get('id'))} {str(r.get('what_seen'))[:40]}（若错约 {float(r.get('if_wrong_effect_m2') or 0):,.0f} m²）", 9, "normal") for r in risks]),
             ("净高：需客户提供。", 10.5, "normal"),
             *([(f"图纸另有其他楼层，未计入：{'、'.join(floors)[:60]}", 10.5, "normal")] if floors else []),

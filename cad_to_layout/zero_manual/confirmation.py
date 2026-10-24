@@ -619,7 +619,7 @@ def apply(read: dict[str, Any], items: list[dict[str, Any]], issued: dict[str, A
                       "decision": rs.get("decision"), "why": rs.get("why"), "wrong_if": rs.get("wrong_if"), "undecided_numbers": rs.get("undecided_numbers") or [],
                       "difference_m2": rs.get("difference_m2"), "difference_region": rs.get("difference_region"), "drawing_matches": rs.get("drawing_matches") or [],
                       "methods": {"a": rs.get("a"), "b": rs.get("b"), "a_method": rs.get("a_method"), "b_method": rs.get("b_method"), "a_valid": rs.get("a_valid"), "b_valid": rs.get("b_valid")},
-                      "risk_review": rs.get("risk_review") or [], "human_review": "可选"})
+                      "risk_review": rs.get("risk_review") or [], "designation_note": rs.get("designation_note"), "human_review": "可选"})
             if b["outline_source"] in {"人工修改", "人工修改（未标记处）"} or (b["outline_source"] == "人工确认" and b["name"] in human_for):
                 b.update({"status_code": "human_edited", "status_zh": "人工修改（不在机器状态内）", "source": "human", "source_zh": "人工修改"})
     if TRIAL_SCOPE:

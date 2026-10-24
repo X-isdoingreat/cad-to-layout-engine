@@ -146,6 +146,29 @@ class PairTest(unittest.TestCase):
         self.assertEqual(out["answer"]["buildings"][0]["area_m2"], 4000.0)
         self.assertEqual(s["wrong_if"], "如果那段墙其实是雨篷边线")
 
+    def test_a_designated_point_on_a_shared_wall_leaves_the_state_undecided_with_a_note(self) -> None:
+        a = _read("wall", "F2", RECT, 4000.0, 100.0, 40.0)
+        b = _read("structure", "F3", TALLER, 4100.0, 100.0, 41.0)
+        a["designation_input"] = "图纸坐标 (50, 40) 处的那栋厂房"  # on A's north edge, 1 m inside B
+        fake = {"answer": {"decision": "adopt_a", "why": "北墙在 y=40", "evidence": ["render 40 38 60 42 → 双线墙"], "wrong_if": "如果 y=41 的线才是外墙"},
+                "minutes": 0.3, "tokens_used": 100, "tool_calls": 2, "model": "fake", "returncode": 0}
+        with mock.patch.object(J.agent_reader, "run_prompt", return_value=fake) as call:
+            out = J.adjudicate_pair(self.work, a, b)
+        self.assertIn("落在墙上", call.call_args.args[1])
+        s = out["result_status"]
+        self.assertEqual((s["status_code"], s["decision"], s["source"]), ("undecided", "adopt_a", "a"))
+        self.assertEqual([n["area_m2"] for n in s["undecided_numbers"]], [4000.0, 4100.0])
+        self.assertIn("指定点 (50, 40)", s["designation_note"])
+        self.assertTrue(s["why"].startswith("指定含糊"))
+        self.assertEqual(out["adjudication"]["designation_on_wall"]["distance_m"], {"a": 0.0, "b": 1.0})
+        # the same point well inside both outlines, and no coordinates at all: no note, the state is the usual one
+        for text in ("图纸坐标 (50, 20) 处的那栋", "二分厂主厂房"):
+            a2, b2 = _read("wall", "F2", RECT, 4000.0, 100.0, 40.0), _read("structure", "F2", RECT, 4000.0, 100.0, 40.0)
+            a2["designation_input"] = text
+            with mock.patch.object(J.agent_reader, "run_prompt", side_effect=AssertionError("no call expected")):
+                s2 = J.adjudicate_pair(self.work, a2, b2)["result_status"]
+            self.assertEqual((s2["status_code"], s2["designation_note"]), ("two_methods_agree", None))
+
     def test_both_wrong_is_adopted_only_when_the_remeasurement_matches_the_drawing(self) -> None:
         a = _read("wall", "F1", NOTCHED, 3940.0, 100.0, 40.0)
         b = _read("structure", "F3", TALLER, 4100.0, 100.0, 41.0)

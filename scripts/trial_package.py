@@ -136,7 +136,7 @@ def result_json(out: Path, customer: Path, designation: str | None, works: list[
         body.update({"status_code": "failed", "status_zh": "读不出", "why": failed or "没有读出指定厂房", "building": None})
     else:
         keys = ("name", "area_m2", "length_m", "width_m", "status_code", "status_zh", "source", "source_zh", "decision", "why", "wrong_if", "undecided_numbers",
-                "difference_m2", "difference_region", "drawing_matches", "methods", "risk_review", "outline_source", "human_review")
+                "difference_m2", "difference_region", "drawing_matches", "methods", "risk_review", "designation_note", "outline_source", "human_review")
         body.update({"status_code": b.get("status_code") or "undecided", "status_zh": b.get("status_zh") or "待定", "building": {k: b.get(k) for k in keys},
                      "human_review": {"optional": True, "package": str(send) if send else None}})
     path = out / "结果.json"

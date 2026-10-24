@@ -572,11 +572,9 @@ def cmd_trace(args: Any) -> dict[str, Any]:
         bx = poly.bounds
         # a note further from this outline than that share of its mean side belongs to another plan (the floor drawn above it)
         reach = STATED_AREA_SEARCH_MARGIN_FRACTION * ((bx[2] - bx[0]) + (bx[3] - bx[1])) / 2
-        for n in notes:
-            if not (STATED_AREA_COMPARABLE_RANGE[0] * area <= n["value_m2"] <= STATED_AREA_COMPARABLE_RANGE[1] * area):
-                continue
-            if not (bx[0] - reach <= n["at"][0] <= bx[2] + reach and bx[1] - reach <= n["at"][1] <= bx[3] + reach):
-                continue
+        in_reach = [n for n in notes if STATED_AREA_COMPARABLE_RANGE[0] * area <= n["value_m2"] <= STATED_AREA_COMPARABLE_RANGE[1] * area
+                    and bx[0] - reach <= n["at"][0] <= bx[2] + reach and bx[1] - reach <= n["at"][1] <= bx[3] + reach]
+        for n in nearest_notes(in_reach, poly, m):  # another plan's note in reach is not this candidate's
             differs = 100 * (area - n["value_m2"]) / n["value_m2"]
             against.append({"kind": "stated_area", "text": n["text"], "value_m2": n["value_m2"], "at": n["at"], "differs_pct": round(differs, 2),
                             "match": abs(differs) <= 100 * STATED_AREA_TOLERANCE_FRACTION})
@@ -770,6 +768,24 @@ def stated_areas(idx: Any, window: list[float]) -> list[dict[str, Any]]:
 PARTIAL_AREA_WORDS = ("分区", "防火", "区域", "房间", "室")
 
 
+def nearest_notes(notes: list[dict[str, Any]], outline: Any, m: float) -> list[dict[str, Any]]:
+    """Of several area notes the ones nearest to the outline (within `STATED_AREA_NEAREST_SLACK_M` of the nearest).
+
+    Two floors drawn one above the other on one sheet each have their note below them; the upper floor's search window
+    reaches the lower floor's note, and that note matched the upper floor within 1% (2026-10-24).  The note of a plan stands
+    next to it, so the nearest comparable note is the plan's own; farther ones are only counted.
+    """
+
+    if len(notes) < 2:
+        return list(notes)
+    from shapely.geometry import Point, Polygon
+
+    poly = outline if hasattr(outline, "distance") else Polygon(outline)
+    dist = [(poly.distance(Point(n["at"][0], n["at"][1])) * m, n) for n in notes]
+    best = min(d for d, _ in dist)
+    return [n for d, n in dist if d <= best + STATED_AREA_NEAREST_SLACK_M]
+
+
 def stated_area_check(outline: list[list[float]], area_m2: float, m: float, idx: Any | None = None) -> dict[str, Any]:
     """Area notes written near the outline (within `STATED_AREA_SEARCH_MARGIN_FRACTION` of its size) against the measured area.
 
@@ -784,7 +800,7 @@ def stated_area_check(outline: list[list[float]], area_m2: float, m: float, idx:
     margin = STATED_AREA_SEARCH_MARGIN_FRACTION * max(max(xs) - min(xs), max(ys) - min(ys))
     window = [min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin]
     reach = STATED_AREA_LABEL_REACH_M / m
-    compared, skipped = [], Counter()
+    compared, comparable, skipped = [], [], Counter()
     for note in stated_areas(idx, window):
         lo, hi = STATED_AREA_COMPARABLE_RANGE
         if not (area_m2 > 0 and lo * area_m2 <= note["value_m2"] <= hi * area_m2):
@@ -797,8 +813,13 @@ def stated_area_check(outline: list[list[float]], area_m2: float, m: float, idx:
         if any(w in note["text"] or w in label for w in PARTIAL_AREA_WORDS):
             skipped["part_of_floor"] += 1
             continue
+        comparable.append({**note, "label": label})
+    near = nearest_notes(comparable, outline, m)
+    if len(near) < len(comparable):
+        skipped["farther_note"] = len(comparable) - len(near)
+    for note in near:
         differs = 100 * (area_m2 - note["value_m2"]) / note["value_m2"]
-        compared.append({**note, "label": label, "measured_m2": round(area_m2, 2), "differs_pct": round(differs, 2),
+        compared.append({**note, "measured_m2": round(area_m2, 2), "differs_pct": round(differs, 2),
                          "flagged": abs(differs) > 100 * STATED_AREA_TOLERANCE_FRACTION})
     return {"compared": compared, "not_compared": dict(skipped)}
 
@@ -1205,6 +1226,7 @@ STATED_AREA_SEARCH_MARGIN_FRACTION = 0.2  # area notes stand below or beside the
 STATED_AREA_COMPARABLE_RANGE = (0.5, 2.0)  # a note this close to the measured area is about the same building
 STATED_AREA_TOLERANCE_FRACTION = 0.01
 STATED_AREA_LABEL_REACH_M = 3.0  # the text standing this close to a bare area number is its label (防火分区2  11953平方米)
+STATED_AREA_NEAREST_SLACK_M = 2.0  # of the comparable notes only the nearest to the outline (and those within this of it) are compared; a farther one belongs to another plan on the sheet
 NOTCH_CLOSE_M = 8.0  # notches narrower than twice this are filled by the closing and marked
 NOTCH_MIN_SHARE = 0.01  # ... when together they reach this share of the area
 

@@ -134,7 +134,8 @@ class AgentToolsTest(unittest.TestCase):
         msp.add_text("防火分区1", dxfattribs={"insert": (65000, 12000), "height": 500})
         msp.add_text("900m²", dxfattribs={"insert": (65000, 11000), "height": 500})  # a compartment, labelled beside it
         msp.add_text("45.5m²", dxfattribs={"insert": (10000, 12000), "height": 300})  # a room
-        msp.add_text("面积：1440M2", dxfattribs={"insert": (10000, 30000), "height": 500})  # 6 m above: compared, matches
+        msp.add_text("面积：1440M2", dxfattribs={"insert": (10000, 30000), "height": 500})  # 6 m above: the nearest note, compared, matches
+        msp.add_text("本层面积1452.00平方米", dxfattribs={"insert": (40000, 33000), "height": 500})  # 9 m above: farther than the nearest + 2 m, another plan's
         doc.saveas("notes.dxf")
         T.build_index("notes.dxf", Path("notes.sqlite"))
         idx = T.Index(Path("notes.sqlite"))
@@ -142,8 +143,8 @@ class AgentToolsTest(unittest.TestCase):
             got = T.stated_area_check([[0, 0], [60000, 0], [60000, 24000], [0, 24000], [0, 0]], 1440.0, 0.001, idx)
         finally:
             idx.con.close()
-        self.assertEqual([(c["value_m2"], c["flagged"]) for c in got["compared"]], [(1500.0, True), (1440.0, False)])
-        self.assertEqual(got["not_compared"], {"part_of_floor": 1, "other_size": 1})
+        self.assertEqual([(c["value_m2"], c["flagged"]) for c in got["compared"]], [(1500.0, True), (1440.0, False)])  # both 6 m away: a tie
+        self.assertEqual(got["not_compared"], {"part_of_floor": 1, "other_size": 1, "farther_note": 1})
 
     def test_trace_lists_outline_candidates_and_ranks_them_by_the_drawing_s_own_numbers(self) -> None:
         # a 60 x 24 m hall: the wall layer has an 8 m gate in the south wall and a corridor wall 3 m inside it; the drafter's

@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -324,6 +325,41 @@ def _designated_of(read: dict[str, Any] | None) -> tuple[dict[str, Any], dict[st
     return (b, c) if b and c else None
 
 
+_POINT = re.compile(r"(-?\d+(?:\.\d+)?)\s*[,，]\s*(-?\d+(?:\.\d+)?)")
+
+
+def designation_point(text: str | None) -> tuple[float, float] | None:
+    """The drawing coordinates named in the designation ("图纸坐标 (515010, 261242) 处的那栋"), if any."""
+
+    hit = _POINT.search(text or "")
+    return (float(hit.group(1)), float(hit.group(2))) if hit else None
+
+
+def designation_on_wall(text: str | None, outlines: dict[str, Any], m: float) -> dict[str, Any] | None:
+    """The designated point lying on a reader's outline edge (within `DESIGNATION_ON_WALL_M`).
+
+    A point on a wall two buildings or two spans share does not say which side was meant (2026-10-24: the point sat on the
+    partition between the north and south spans; one reader took the north span, the other the whole hall).  Noted on the
+    result; when the two readers differ, the state stays undecided with both numbers instead of a reviewer's choice.
+    """
+
+    from .constants import DESIGNATION_ON_WALL_M
+
+    pt = designation_point(text)
+    if pt is None:
+        return None
+    from shapely.geometry import Point, Polygon
+
+    p = Point(pt)
+    dist = {k: round(Polygon(o).exterior.distance(p) * m, 2) for k, o in outlines.items() if o and len(o) >= 4}
+    on = {k: d for k, d in dist.items() if d <= DESIGNATION_ON_WALL_M}
+    if not on:
+        return None
+    where = "、".join(f"{SOURCE_CN[k]}的轮廓边线 {d:g} m" for k, d in on.items())
+    return {"point": list(pt), "distance_m": dist, "threshold_m": DESIGNATION_ON_WALL_M,
+            "message_zh": f"指定点 ({pt[0]:g}, {pt[1]:g}) 距{where}，落在墙上；这道墙两侧哪一边才是指定的楼，指定里没有说明"}
+
+
 def numbers_agree(a: dict[str, Any], b: dict[str, Any]) -> bool:
     """Area, length and width all within TWO_METHOD_AGREE_FRACTION of the larger value."""
 
@@ -560,6 +596,9 @@ def adjudicate_pair(work_a: Path, read_a: dict[str, Any], read_b: dict[str, Any]
         only = None if b else "a"
     region = difference_region(a[1]["outline"], b[1]["outline"], m) if (a and b and only is None) else None
     agree = bool(a and b and only is None and record["b_method_available"] and numbers_agree(_measured(a[1]), _measured(b[1])))
+    on_wall = designation_on_wall(read_a.get("designation_input") or (read_b or {}).get("designation_input"),
+                                  {"a": a[1]["outline"] if a else None, "b": b[1]["outline"] if (b and only is None) else None}, m)
+    record["designation_on_wall"] = on_wall
     pair_info = {"building": a[0].get("name"), "a": _measured(a[1]), "b": _measured(b[1]), "region": region, "difference_m2": region["difference_m2"]} if region and not agree else None
     read_a["_found"] = agent_reader.findings(work_a, read_a["answer"], read_a["checks"])
     if read_b:
@@ -576,6 +615,9 @@ def adjudicate_pair(work_a: Path, read_a: dict[str, Any], read_b: dict[str, Any]
                        "verdicts": [], "overrides": [], "refused": [], "evidence": [], "wrong_if": ""})
     else:
         prompt = _pair_prompt(read_a, read_b if only is None else None, a, b if only is None else None, b_face, disc, geometry, region, budget)
+        if on_wall:
+            prompt += (f"\n## 程序提示：指定含糊\n\n{on_wall['message_zh']}。两人若取了这道墙的不同侧，那不是读图错误，是指定没说清：请在 notes 里写明墙两侧各是什么"
+                       "（楼名、跨、功能），决定照常给出，程序会把两个数并列、状态记为待定。\n")
         done = agent_reader.run_prompt(work_a, prompt, tag="_adjudicate", timeout_seconds=timeout_seconds, answer_key="decision", model=ADJUDICATOR_MODEL)
         dec = validate_decision(done["answer"], disc, bool(a), bool(b and only is None))
         record.update({"status": "answered" if done["answer"] else "no_answer", **dec, "minutes": done["minutes"], "tokens_used": done["tokens_used"],
@@ -631,8 +673,13 @@ def adjudicate_pair(work_a: Path, read_a: dict[str, Any], read_b: dict[str, Any]
         code = "two_methods_agree"
     else:
         code = "undecided"
+    why = record.get("why")
+    if on_wall and a and b and only is None and not agree:  # the two readers took different ranges round an ambiguous point: not the reviewer's to decide
+        code = "undecided"
+        why = f"指定含糊：{on_wall['message_zh']}；两种读法取了不同的范围，程序不定夺，两个数并列。复查意见仅供参考：{record.get('why') or ''}"
     final_m = _measured(final_check)
-    status.update({"status_code": code, "status_zh": STATUS_CN[code], "source": source, "source_zh": SOURCE_CN[source], "decision": decision, "why": record.get("why"),
+    status.update({"status_code": code, "status_zh": STATUS_CN[code], "source": source, "source_zh": SOURCE_CN[source], "decision": decision, "why": why,
+                   "designation_note": on_wall["message_zh"] if on_wall else None,
                    "wrong_if": record.get("wrong_if"), "evidence": record.get("evidence"), "agree": agree, "drawing_matches": hits,
                    "final": {"area_m2": final_m.get("area_m2"), "length_m": final_m.get("length_m"), "width_m": final_m.get("width_m")},
                    "difference_m2": region["difference_m2"] if region else None, "difference_region": region["description"] if region else None,
