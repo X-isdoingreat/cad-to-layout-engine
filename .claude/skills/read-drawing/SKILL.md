@@ -45,6 +45,7 @@ Read `<folder>/结果.json` first (`status_code`: `ok` / `failed` / `equipment_l
   the reason and no number;
 - equipment: the main types and counts on the plan shown; a kind drawn as rows is given as rows and cells, and rows of one kind drawn by several blocks are one kind (`drawn_by`, `cells_per_row`,
   `cells` in `结果.json`), never as one added-up number;
+- closer look: a kind whose two first-look votes differ or say unsure, every row kind and every kind with 50 or more copies is looked at by an AI agent with the drawing tools (`basis: agent_look`, with `looked_at`, `first_look`, `agrees_with_first_look` in `equipment.json`); what it still cannot tell stays uncounted.
 - how many places need confirmation (part 三) and how to reply (one sentence with the numbers);
 - what was not read (e.g. equipment drawn as loose lines or parts, other floors, height).
 Never call a number correct beyond its status: 与图上数字一致 and 两种方法一致 are system findings, 待定 is two numbers, not one.

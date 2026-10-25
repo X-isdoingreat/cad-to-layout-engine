@@ -120,7 +120,7 @@ def run_read(source: str | Path, out_dir: str | Path, *, allow_external_llm: boo
     (out / "warehouse_geometry.md").write_text(summary_markdown(geometry, unit), encoding="utf-8")
 
     equipment = recognise(inventory, final["views"], unit, doc, out / "equipment", judge, allow_external_llm,
-                          Path(replay_types) if replay_types else None, opened=segmented.get("opened_containers"))
+                          Path(replay_types) if replay_types else None, opened=segmented.get("opened_containers"), dxf=dxf)
     manifest["stages"]["equipment"] = {
         "sha256": _json(out / "equipment.json", equipment),
         "stage_counts": equipment.get("stage_counts"),

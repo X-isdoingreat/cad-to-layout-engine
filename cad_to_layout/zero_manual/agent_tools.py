@@ -20,6 +20,15 @@ it cites.
   zones x1 y1 x2 y2 [--layers L ...] [--match REGEX]   area names, each with the smallest closed face around it
   corners x1 y1 x2 y2 x3 y3 ... [--layers L ...] [--snap-m 1]   trace a building by its outer corners (snapped to the walls)
   elevations x1 y1 x2 y2 [--near-m 5]  elevation numbers with the words beside them and the nearest section/elevation title
+
+Block-level tools of the closer look (2026-10-25), over blocks.json written by the equipment reading (the program's whole
+state about every block family: sizes, copies, parents, children, rows, the first look's votes); pictures through the index:
+  blocks [--match REGEX] [--min-copies N]   every block family with its copies, size and first look
+  block NAME                          everything known about one family, each copy's box and view
+  near NAME [--radius-m 10]           the families standing within the radius of its copies, nearest gap, their first look; texts
+  compare A B                         two families side by side: size, copies, cells / pitch / depth, placement, nearest gap
+  render_block NAME out.png [--copy K] [--margin-m M] [--blocks OTHER ...]   one copy and its surroundings, the family in red
+  render ... --blocks NAME ...        any render with block families outlined
 """
 
 from __future__ import annotations
@@ -34,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 INDEX = Path("index.sqlite")
+BLOCKS = Path("blocks.json")  # the closer look's state file (closer_look.write_state)
 FACES = Path("faces.json")
 COLUMNS = Path("columns.json")
 UNIT_M = {1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1.0}
@@ -353,12 +363,175 @@ def cmd_render(args: Any) -> dict[str, Any]:
         for t in idx["texts"]:
             if box[0] <= t["x"] <= box[2] and box[1] <= t["y"] <= box[3]:
                 axis.text(t["x"], t["y"], t["t"][:20], color="#1d4ed8", fontsize=7, ha="center", va="center")
+    marked = _draw_blocks(axis, getattr(args, "blocks", None), box) if getattr(args, "blocks", None) else {}
     figure.savefig(args.out, facecolor="white")
     pyplot.close(figure)
     note = "axis ticks are drawing coordinates"
     if total > RENDER_LIMIT:
         note += f"; the window holds {total} lines and only the {RENDER_LIMIT} largest are drawn - zoom in or choose layers"
-    return {"image": args.out, "window": box, "lines_in_window": total, "note": note}
+    out = {"image": args.out, "window": box, "lines_in_window": total, "note": note}
+    if marked:
+        out["blocks_in_window"] = marked
+    return out
+
+
+# ---------------------------------------------------------------- block families (the closer look, 2026-10-25)
+BLOCK_COLOURS = [("#dc2626", "#fca5a5"), ("#1d4ed8", "#93c5fd"), ("#059669", "#6ee7b7"), ("#d97706", "#fcd34d"), ("#7c3aed", "#c4b5fd")]
+
+
+def _blocks_state() -> dict[str, Any]:
+    if not BLOCKS.is_file():
+        raise SystemExit(f"{BLOCKS} not found: the block tools run in the closer look's work directory")
+    return json.loads(BLOCKS.read_text(encoding="utf-8"))
+
+
+def _family(state: dict[str, Any], name: str) -> dict[str, Any]:
+    fam = state["families"].get(name)
+    if fam is None:
+        raise SystemExit(f"no block family {name!r}: list them with `blocks` (names are case-sensitive)")
+    return fam
+
+
+def _gap(a: list[float], b: list[float]) -> float:
+    """The gap between two boxes (0 when they touch or overlap)."""
+
+    dx = max(0.0, a[0] - b[2], b[0] - a[2])
+    dy = max(0.0, a[1] - b[3], b[1] - a[3])
+    return math.hypot(dx, dy)
+
+
+def _nearest_gap(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return min((_gap(p["bbox"], q["bbox"]) for p in a["occurrences"] for q in b["occurrences"]), default=math.inf)
+
+
+def _out_inside(name: str) -> None:
+    p = Path(name)
+    if p.is_absolute() or ".." in p.parts or p.suffix.lower() != ".png":
+        raise SystemExit("pictures are written inside the work directory: give a file name such as look_a.png")
+
+
+def _brief(fam: dict[str, Any]) -> dict[str, Any]:
+    first = fam.get("first_look") or {}
+    return {"copies": fam["copies"], "size_mm": fam["size_mm"], "first_look": {k: first.get(k) for k in ("type", "basis", "votes", "name")} if first else None,
+            "row": {k: fam["row"].get(k) for k in ("cells_per_row", "groups", "pitch_mm", "cell_family")} if fam.get("row") else None}
+
+
+def cmd_blocks(args: Any) -> dict[str, Any]:
+    state = _blocks_state()
+    rx = re.compile(args.match) if args.match else None
+    rows = [{"block": name, **_brief(fam)} for name, fam in sorted(state["families"].items(), key=lambda kv: (-kv[1]["copies"], kv[0]))
+            if fam["copies"] >= (args.min_copies or 0) and (rx is None or rx.search(name))]
+    page = _page(rows, args)
+    return {**page, "metres_per_unit": state["metres_per_unit"], "blocks": rows[page["offset"]: page["offset"] + args.limit]}
+
+
+def cmd_block(args: Any) -> dict[str, Any]:
+    state = _blocks_state()
+    fam = _family(state, args.name)
+    occ = fam["occurrences"]
+    return {"block": args.name, "metres_per_unit": state["metres_per_unit"], **{k: fam[k] for k in ("size_mm", "copies", "views", "parents", "children", "texts_inside", "layers")},
+            "row": fam.get("row"), "same_kind_as": fam.get("follows"), "array": fam.get("array"), "first_look": fam.get("first_look"),
+            "occurrences_shown": min(len(occ), 30), "occurrences": occ[:30],
+            "note": "bbox = [x1, y1, x2, y2] in drawing coordinates; render_block draws any copy with --copy K (0-based, in this order)"}
+
+
+def cmd_near(args: Any) -> dict[str, Any]:
+    state = _blocks_state()
+    m = state["metres_per_unit"]
+    fam = _family(state, args.name)
+    radius = args.radius_m / m
+    mine = [o["bbox"] for o in fam["occurrences"]]
+    reach = [min(b[0] for b in mine) - radius, min(b[1] for b in mine) - radius, max(b[2] for b in mine) + radius, max(b[3] for b in mine) + radius]
+    found = []
+    for other, f in state["families"].items():
+        if other == args.name:
+            continue
+        best, within = math.inf, 0
+        for o in f["occurrences"]:
+            b = o["bbox"]
+            if b[2] < reach[0] or b[0] > reach[2] or b[3] < reach[1] or b[1] > reach[3]:
+                continue
+            g = min(_gap(b, q) for q in mine)
+            if g <= radius:
+                within += 1
+                best = min(best, g)
+        if within:
+            found.append({"block": other, "copies_within_radius": within, "nearest_gap_m": round(best * m, 2),
+                          "placement": "inside it" if other in fam["children"] else "it is inside this" if other in fam["parents"] else "beside",
+                          **_brief(f)})
+    found.sort(key=lambda r: (r["nearest_gap_m"], -r["copies_within_radius"]))
+    texts = []
+    try:
+        idx = _load()
+    except SystemExit:
+        idx = None
+    if idx is not None:
+        for t in idx["texts"]:
+            g = min(_gap([t["x"], t["y"], t["x"], t["y"]], q) for q in mine)
+            if g <= radius and len(t["t"]) <= 30:
+                texts.append((round(g * m, 2), t["t"], t["x"], t["y"]))
+        texts.sort()
+    return {"block": args.name, "radius_m": args.radius_m, "copies": fam["copies"], "families_found": len(found), "families": found[:60],
+            "texts_within_radius": [[t, x, y, g] for g, t, x, y in texts[:40]]}
+
+
+def cmd_compare(args: Any) -> dict[str, Any]:
+    state = _blocks_state()
+    m = state["metres_per_unit"]
+    a, b = _family(state, args.a), _family(state, args.b)
+
+    def side(name: str, fam: dict[str, Any]) -> dict[str, Any]:
+        return {"block": name, "size_mm": fam["size_mm"], "depth_mm": min(fam["size_mm"]), "copies": fam["copies"], "views": fam["views"],
+                "parents": fam["parents"], "children": fam["children"], "texts_inside": fam["texts_inside"], "row": fam.get("row"),
+                "array": fam.get("array"), "first_look": fam.get("first_look")}
+
+    gap = _nearest_gap(a, b)
+    same = {"cells_per_row": bool(a.get("row") and b.get("row") and a["row"]["cells_per_row"] == b["row"]["cells_per_row"]),
+            "pitch": bool(a.get("row") and b.get("row") and abs(float(a["row"]["pitch_mm"]) - float(b["row"]["pitch_mm"])) <= 0.05 * max(float(a["row"]["pitch_mm"]), float(b["row"]["pitch_mm"]))),
+            "depth_within_25_percent": min(min(a["size_mm"]), min(b["size_mm"])) >= 0.75 * max(min(a["size_mm"]), min(b["size_mm"]))}
+    return {"a": side(args.a, a), "b": side(args.b, b), "nearest_gap_m": round(gap * m, 2) if gap < math.inf else None,
+            "a_inside_b": args.b in a["parents"], "b_inside_a": args.a in b["parents"], "same_structure": same}
+
+
+def _draw_blocks(axis: Any, names: list[str], box: list[float]) -> dict[str, int]:
+    """Outline the copies of the named families inside the window (the first family red, the others blue, green, ...)."""
+
+    from matplotlib import patches
+
+    state = _blocks_state()
+    marked: dict[str, int] = {}
+    for i, name in enumerate(names):
+        fam = state["families"].get(name)
+        if fam is None:
+            continue
+        edge, fill = BLOCK_COLOURS[i % len(BLOCK_COLOURS)]
+        n = 0
+        for o in fam["occurrences"]:
+            b = o["bbox"]
+            if b[2] < box[0] or b[0] > box[2] or b[3] < box[1] or b[1] > box[3]:
+                continue
+            axis.add_patch(patches.Rectangle((b[0], b[1]), b[2] - b[0], b[3] - b[1], linewidth=1.4, edgecolor=edge, facecolor=fill, alpha=0.25))
+            if n == 0:
+                axis.text(b[0], b[3], name[:24], color=edge, fontsize=8, ha="left", va="bottom")
+            n += 1
+        marked[name] = n
+    return marked
+
+
+def cmd_render_block(args: Any) -> dict[str, Any]:
+    state = _blocks_state()
+    m = state["metres_per_unit"]
+    fam = _family(state, args.name)
+    _out_inside(args.out)
+    occ = sorted(fam["occurrences"], key=lambda o: (o["bbox"][0], o["bbox"][1]))
+    k = len(occ) // 2 if args.copy is None else max(0, min(int(args.copy), len(occ) - 1))
+    b = occ[k]["bbox"]
+    margin = (args.margin_m if args.margin_m is not None else max(2.0, max(fam["size_mm"]) / 1000.0)) / m
+    box = [b[0] - margin, b[1] - margin, b[2] + margin, b[3] + margin]
+    inner = argparse.Namespace(box=box, out=args.out, layers=None, faces=None, no_text=args.no_text, blocks=[args.name] + list(args.blocks or []))
+    out = cmd_render(inner)
+    return {**out, "block": args.name, "copy_drawn": k, "copy_bbox": b, "margin_m": round(margin * m, 2),
+            "note": out["note"] + f"; {args.name} is outlined red, --blocks families blue/green/orange; the window is copy {k} of {len(occ)} plus the margin"}
 
 
 def polygon_faces(sel: list[dict[str, Any]], m: float, gap_m: float) -> tuple[list[Any], int]:
@@ -1241,6 +1414,13 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("window"); p.add_argument("box", nargs=4, type=float); p.add_argument("--layers", nargs="*"); p.add_argument("--limit", type=int, default=150)
     p.add_argument("--offset", type=int, default=0)
     p = sub.add_parser("render"); p.add_argument("box", nargs=4, type=float); p.add_argument("out"); p.add_argument("--layers", nargs="*"); p.add_argument("--faces", nargs="*"); p.add_argument("--no-text", action="store_true")
+    p.add_argument("--blocks", nargs="*", help="block families to outline (closer look)")
+    p = sub.add_parser("blocks"); p.add_argument("--match"); p.add_argument("--min-copies", type=int, default=0); p.add_argument("--limit", type=int, default=120); p.add_argument("--offset", type=int, default=0)
+    p = sub.add_parser("block"); p.add_argument("name")
+    p = sub.add_parser("near"); p.add_argument("name"); p.add_argument("--radius-m", type=float, default=10.0)
+    p = sub.add_parser("compare"); p.add_argument("a"); p.add_argument("b")
+    p = sub.add_parser("render_block"); p.add_argument("name"); p.add_argument("out"); p.add_argument("--copy", type=int); p.add_argument("--margin-m", type=float)
+    p.add_argument("--blocks", nargs="*"); p.add_argument("--no-text", action="store_true")
     p = sub.add_parser("around"); p.add_argument("face_ids", nargs="+"); p.add_argument("--layers", nargs="*"); p.add_argument("--unit-m", type=float)
     p.add_argument("--margin-m", type=float, default=40.0); p.add_argument("--gap", type=float, default=1.0); p.add_argument("--min-area", type=float, default=5.0)
     p = sub.add_parser("envelope"); p.add_argument("box", nargs=4, type=float); p.add_argument("--layers", nargs="*"); p.add_argument("--unit-m", type=float)
@@ -1278,7 +1458,8 @@ def main(argv: list[str] | None = None) -> int:
         result = {"overview": cmd_overview, "texts": cmd_texts, "window": cmd_window, "render": cmd_render, "faces": cmd_faces,
                   "measure": cmd_measure, "columns": cmd_columns, "envelope": cmd_envelope, "around": cmd_around,
                   "column_instances": cmd_column_instances, "dimensions": cmd_dimensions, "trace": cmd_trace,
-                  "elevations": cmd_elevations, "zones": cmd_zones, "corners": cmd_corners}[args.cmd](args)
+                  "elevations": cmd_elevations, "zones": cmd_zones, "corners": cmd_corners,
+                  "blocks": cmd_blocks, "block": cmd_block, "near": cmd_near, "compare": cmd_compare, "render_block": cmd_render_block}[args.cmd](args)
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
     return 0
 

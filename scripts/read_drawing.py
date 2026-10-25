@@ -57,7 +57,7 @@ def _claude_call_usage(events: Path) -> list[dict]:
             model = (event.get("message") or {}).get("model") or model
         elif event.get("type") == "result":
             usage = event.get("usage") or {}
-            out.append({"part": "设备", "step": "复看" if "second_look" in events.parts else "判官", "backend": "claude", "model": model,
+            out.append({"part": "设备", "step": "细看" if "closer_look" in events.parts else "复看" if "second_look" in events.parts else "判官", "backend": "claude", "model": model,
                         "minutes": round(float(event.get("duration_ms") or 0) / 60000, 1), "cost_usd_equivalent": event.get("total_cost_usd"),
                         "error": "is_error" if event.get("is_error") else None,
                         "tokens_used": sum(int(usage.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))})

@@ -221,11 +221,17 @@ REPEAT_ALREADY_COUNTED_SHARE = 0.5
 # geometry for one building is measured in a window round the readers' outlines widened by PROGRAM_GEOMETRY_MARGIN_M.
 TWO_METHOD_AGREE_FRACTION = 0.01
 PROGRAM_GEOMETRY_MARGIN_M = 15.0
-# Equipment type judge: a block family that occurs at least HIGH_COUNT_KIND_MIN times decides a large part of the count, so when
-# its first SPLIT_JUDGE_REPEATS votes disagree the sheet is asked TYPE_JUDGE_EXTRA_VOTES more times, with the earlier
-# judgements' reasons shown; the majority is then over all votes.
+# Equipment type judge (2026-10-25, CEO: votes are a cheap alarm, not the decision): every sheet of tiles is asked TYPE_JUDGE_VOTES
+# times with a different layout.  A family whose votes do not all agree, or whose answer is UNSURE, gets the closer look: an AI
+# agent with the drawing tools (agent_tools block / near / compare / render_block) looks for itself and decides.  The closer look
+# is also given, whatever the votes, to the kinds that decide a large part of the count: rows, and families with at least
+# HIGH_COUNT_KIND_MIN copies.  At most CLOSER_LOOK_MAX_FAMILIES families per drawing (the most copies first); each look is told
+# to run at most CLOSER_LOOK_MAX_TOOL_CALLS tool commands and is stopped after CLOSER_LOOK_TIMEOUT_SECONDS.
+TYPE_JUDGE_VOTES = 2
 HIGH_COUNT_KIND_MIN = 50
-TYPE_JUDGE_EXTRA_VOTES = 2
+CLOSER_LOOK_MAX_FAMILIES = 12
+CLOSER_LOOK_MAX_TOOL_CALLS = 30
+CLOSER_LOOK_TIMEOUT_SECONDS = 1200.0
 # A designated point within this distance of a reader's outline edge lies on a wall, maybe one two buildings or spans
 # share: which side was meant is not stated, so two readers taking different sides is not decided by the reviewer.
 DESIGNATION_ON_WALL_M = 2.0

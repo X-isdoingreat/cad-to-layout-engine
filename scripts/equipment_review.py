@@ -71,6 +71,19 @@ def not_counted(equipment: dict[str, Any], views: dict[str, Any]) -> set[str]:
     return out
 
 
+def basis_text(first: dict[str, Any], decision: dict[str, Any]) -> str:
+    """The basis column: the drawing's text, the first look's votes, or the closer look's evidence (2026-10-25)."""
+
+    votes = decision.get("votes") or []
+    if first["basis"] == "text":
+        return "图上文字"
+    if first["basis"] == "agent_look":
+        first_type = (decision.get("first_look") or {}).get("type")
+        verdict = "，与第一遍一致）" if decision.get("agrees_with_first_look") else "，改了第一遍的判断）" if first_type else "）"
+        return f"AI 细看（查了 {len(decision.get('looked_at') or [])} 处证据" + verdict
+    return f"AI 看图（{Counter(votes).most_common(1)[0][1]}/{len(votes)} 次一致）" if votes else "AI 看图"
+
+
 def items_of(equipment: dict[str, Any], views: dict[str, Any]) -> list[dict[str, Any]]:
     """One review item per kind (family) the program counted, plus kinds it could not type that occur often."""
 
@@ -87,7 +100,7 @@ def items_of(equipment: dict[str, Any], views: dict[str, Any]) -> list[dict[str,
         votes = decision.get("votes") or []
         cells = sum(r.get("cells") or 0 for r in records if r["view_id"] not in copies)  # a row is one record; its cells are the second level
         items.append({"family": family, "type": first["type"], "type_zh": first["type_zh"], "name": first.get("name") or "",
-                      "basis": "图上文字" if first["basis"] == "text" else (f"AI 看图（{Counter(votes).most_common(1)[0][1]}/{len(votes)} 次一致）" if votes else "AI 看图"),
+                      "basis": basis_text(first, decision),
                       "wrong_if": decision.get("wrong_if") or "",
                       "drawn_as": first.get("drawn_as", "block"), "sample_ref": first["ref"],
                       "count": sum(n for v, n in per_view.items() if v not in copies), "per_view": dict(per_view),

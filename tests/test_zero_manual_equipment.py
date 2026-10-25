@@ -90,7 +90,7 @@ class EquipmentTests(unittest.TestCase):
         self.assertEqual(fams["QWER"]["decision"]["type"], "PALLET_CONV_ROLLER")
         self.assertEqual(fams["ZXCV"]["decision"]["type"], "UNRECOGNISED")
         self.assertEqual(fams["LONG"]["decision"]["reason"], "size_implausible_for_type")
-        self.assertEqual(judge.calls, 3)
+        self.assertEqual(judge.calls, 2, "one sheet, two votes (2026-10-25)")
         by_type: dict[str, list[dict]] = {}
         for r in result["records"]:
             by_type.setdefault(r["type"], []).append(r)

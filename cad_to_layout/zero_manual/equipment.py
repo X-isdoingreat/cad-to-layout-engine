@@ -26,19 +26,22 @@ import json
 import math
 import random
 import re
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
 from .candidates import bind_texts, number_series, outline_cell_groups, regular_arrays, row_blocks, row_kinds
+from .closer_look import ARCHIVE_NAME as CLOSER_LOOK_ARCHIVE, closer_look, needs_look
 from .constants import (
     BACKGROUND_MIN_FAMILIES,
     BACKGROUND_ONCE_ONLY_SHARE,
     EQUIPMENT_MIN_SIZE_MM,
     PALLET_CONVEYOR_MIN_WIDTH_MM,
+    CLOSER_LOOK_MAX_FAMILIES,
     SPLIT_JUDGE_MAJORITY,
-    SPLIT_JUDGE_REPEATS,
     TYPE_JUDGE_TILES_PER_SHEET,
+    TYPE_JUDGE_VOTES,
     DUPLICATE_VIEW_MIN_OVERLAP,
     TYPE_SIZE_RANGES_MM,
     ZONE_LABEL_MIN_COVERAGE,
@@ -52,6 +55,8 @@ GUIDANCE_ID = "type_guidance_v3"
 TYPES = {"RACK", "STACKER", "PALLET_CONV_CHAIN", "PALLET_CONV_ROLLER", "CONVEYOR_UNKNOWN_SUBTYPE", "BOX_CONVEYOR",
          "BOX_LIFT", "ROBOT_ARM", "OTHER_EQUIPMENT", "COMPONENT", "NOT_EQUIPMENT", "UNSURE"}
 EQUIPMENT_TYPES = TYPES - {"COMPONENT", "NOT_EQUIPMENT", "UNSURE"}
+AI_BASES = {"llm_shape", "agent_look"}  # decided by an AI: the first look's votes, or the closer look's agent (2026-10-25)
+LOOK_ORDER = ["first_look_disagreed", "first_look_unsure", "row", "many_copies"]  # who gets the closer look's budget first
 LABEL_ZH = {"RACK": "货架", "STACKER": "堆垛机", "PALLET_CONV_CHAIN": "托盘输送机（链条）", "PALLET_CONV_ROLLER": "托盘输送机（滚筒）",
             "CONVEYOR_UNKNOWN_SUBTYPE": "输送机（子类未识别）", "BOX_CONVEYOR": "箱式输送机", "BOX_LIFT": "箱式提升机",
             "ROBOT_ARM": "机械臂", "OTHER_EQUIPMENT": "其他设备"}
@@ -398,11 +403,8 @@ def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[
                  row_info: dict[str, dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
     """Returns {family: {"status": agreed|disagreed|skipped, "type", "votes", "reasons", "wrong_if", "sheet", "tile_id"}}.
 
-    Every sheet is asked SPLIT_JUDGE_REPEATS times.  A family that occurs at least HIGH_COUNT_KIND_MIN times decides a large part
-    of the count, so when its votes do not reach a majority the sheet is asked TYPE_JUDGE_EXTRA_VOTES more times with the earlier
-    judgements' reasons printed (2026-10-23); the majority is then over all votes."""
-
-    from .constants import HIGH_COUNT_KIND_MIN, TYPE_JUDGE_EXTRA_VOTES
+    Every sheet is asked TYPE_JUDGE_VOTES times with a different tile layout and the votes must all agree: two votes are a cheap
+    alarm that the answer is unstable, not the decision -- what they cannot settle goes to the closer look (2026-10-25)."""
 
     work_dir.mkdir(parents=True, exist_ok=True)
     array_info: dict[str, dict[str, Any]] = {}
@@ -476,14 +478,8 @@ def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[
             for ask in asks:
                 record(ask.get("parsed"))
         elif transport is not None and allow_external:
-            for ask_index in range(1, SPLIT_JUDGE_REPEATS + 1):
+            for ask_index in range(1, TYPE_JUDGE_VOTES + 1):
                 ask_once(ask_index, {})
-            # a high-count family without a majority: more votes, with the earlier judgements and their reasons shown
-            if any(max(len(fam["occurrences"]), (row_info or {}).get(fam["family"], {}).get("kind_occurrences", 0)) >= HIGH_COUNT_KIND_MIN
-                   and _majority(votes[tid])[0] is None for tid, fam in tiles):
-                for extra in range(1, TYPE_JUDGE_EXTRA_VOTES + 1):
-                    earlier = {tid: list(zip(votes[tid], reasons[tid])) for tid, _ in tiles if votes[tid]}
-                    ask_once(SPLIT_JUDGE_REPEATS + extra, earlier)
             saved[key] = {"tiles": [[tid, fam["family"]] for tid, fam in tiles], "asks": asks, "guidance_id": GUIDANCE_ID,
                           "guidance_sha256": hashlib.sha256(GUIDANCE.encode("utf-8")).hexdigest()}
         for tid, fam in tiles:
@@ -515,7 +511,9 @@ def size_plausible(kind: str, size_mm: tuple[float, float], row: bool = False) -
 
 def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict[str, Any], doc: Any, work_dir: Path,
               transport: Callable | None, allow_external: bool, replay: Path | None = None,
-              opened: list[str] | None = None) -> dict[str, Any]:
+              opened: list[str] | None = None, dxf: Path | None = None, looker: Callable | None = None) -> dict[str, Any]:
+    """`dxf`: the drawing file, for the closer look's line index; `looker`: a stand-in for the closer look's agent (tests)."""
+
     scale = UNIT_TO_MM.get(str(unit.get("unit")))
     if scale is None:
         return {"status": "unit_unknown", "message_zh": "单位不明，不识别设备"}
@@ -667,6 +665,7 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
     all_boxes = [o["bbox"] for o in inventory["occurrences"] if o["bbox"]]
     pending = {k for k in families if k not in decisions and k not in cell_rows and k not in follower_of}  # cells and follower rows are decided through their rows / kind
     start = 0
+    looks_done = 0
     while pending:
         ready = sorted(k for k in pending if k in array_families or k in rows or any(p is None or holds_machines(p) is True for p in parents[k]))
         parts = sorted(k for k in pending if k not in ready and all(p is not None and holds_machines(p) is False for p in parents[k]))
@@ -699,6 +698,31 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
                 decisions[key] = {"type": "UNRECOGNISED", "basis": "llm_shape", "stage": "llm", "reason": f"judge_{j['status']}", "votes": j.get("votes", []),
                                   "tile": [j["sheet"], j["tile_id"]], **extra}
                 stage_counts[f"llm_{j['status']}"] += 1
+        # the closer look (2026-10-25): an agent with the drawing tools looks for itself at what the two votes could not settle,
+        # and at the kinds that decide a large part of the count (rows, families with many copies), whatever the votes
+        wanted = {k: why for k in sorted(ready, key=lambda k: (-len(families[k]["occurrences"]), k)) if k in judged
+                  for why in [needs_look(k, families[k], judged[k], rows, follower_of)] if why}
+        # the budget goes first to what the votes could not settle, then to the rows, then to the many-copies kinds
+        wanted = dict(sorted(wanted.items(), key=lambda kv: (LOOK_ORDER.index(kv[1]), -len(families[kv[0]]["occurrences"]), kv[0])))
+        for k in list(wanted)[max(0, CLOSER_LOOK_MAX_FAMILIES - looks_done):]:
+            decisions[k]["closer_look_skipped"] = f"over the budget of {CLOSER_LOOK_MAX_FAMILIES} looks per drawing"
+            stage_counts["closer_look_over_budget"] += 1
+            del wanted[k]
+        if wanted and allow_external and (transport is not None or looker is not None):
+            looks_done += len(wanted)
+            looked = closer_look(work_dir / "closer_look", dxf, wanted, families, decisions, rows, arrays, scale, views, follower_of, LABEL_ZH, TYPES,
+                                 looker, replay.parent.parent / "closer_look" / CLOSER_LOOK_ARCHIVE if replay else None)
+            for k, d in looked.items():
+                if d.get("closer_look_error"):
+                    decisions[k]["closer_look_error"] = d["closer_look_error"]
+                    stage_counts["closer_look_failed"] += 1
+                    continue
+                d["tile"] = decisions[k].get("tile")
+                decisions[k] = d
+                stage_counts["closer_look"] += 1
+                stage_counts["closer_look_unsure" if d["type"] == "UNRECOGNISED" else "closer_look_agreed_first" if d.get("agrees_with_first_look") else "closer_look_changed"] += 1
+        elif wanted:
+            stage_counts["closer_look_unavailable"] += len(wanted)
         decide_cells()
     for key in sorted(pending):  # cannot happen in a block hierarchy; kept visible if it ever does
         decisions[key] = {"type": "UNRECOGNISED", "basis": "geometry", "stage": "rules", "reason": "not_reached_by_the_top_down_judgement"}
@@ -752,7 +776,7 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
             above = machine_ancestors(occ)
             if not above:
                 countable.append((key, occ))
-            elif (key in rows or occ["ref"] in array_of) and all(decisions[p["original_block"]]["basis"] == "llm_shape" for p in above):
+            elif (key in rows or occ["ref"] in array_of) and all(decisions[p["original_block"]]["basis"] in AI_BASES for p in above):
                 # rows, or a packed regular array of modules: they are counted, the outer block is their assembly
                 countable.append((key, occ))
                 for p in above:
@@ -778,7 +802,7 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
         if occ["ref"] in assemblies:
             continue
         d = decisions[key]
-        if d["basis"] == "llm_shape" and any(v["view_id"] == occ["view_id"] and polygon.contains(Point(*_centre(occ["bbox"]))) for v, polygon in outline_machines):
+        if d["basis"] in AI_BASES and any(v["view_id"] == occ["view_id"] and polygon.contains(Point(*_centre(occ["bbox"]))) for v, polygon in outline_machines):
             parts_of_outline_machines += 1  # drawn inside a machine identified by its written name
             continue
         position = (key, tuple(tuple(round(v, 1) for v in pt) for pt in occ["footprint"]))
@@ -792,7 +816,7 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
         record = {"ref": occ["ref"], "view_id": occ["view_id"], "type": d["type"], "type_zh": LABEL_ZH.get(d["type"], d["type"]),
                   "name": d.get("name", ""), "family": key, "basis": basis,
                   "drawn_as": "row" if key in rows else "loose_cell" if key in cell_rows else "block",
-                  "status": "accepted" if basis != "llm_shape" else "pending_independent_count_and_spot_check",
+                  "status": "accepted" if basis not in AI_BASES else "pending_independent_count_and_spot_check",
                   "centre": [round(v, 1) for v in _centre(occ["bbox"])], "length_mm": round(L, 1), "width_mm": round(W, 1),
                   "rotation_deg": round(math.degrees(math.atan2(m[1], m[0])) % 360.0, 2)}
         if key in rows:  # one row is one record; its cells are the second level of the count
@@ -849,7 +873,7 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
                     d = decisions[key]
                     unit.update({"type": d["type"], "type_zh": LABEL_ZH.get(d["type"], d["type"]), "name": d.get("name", ""), "basis": d["basis"],
                                  "host_ref": occ["ref"], "host_family": key})
-                    by_number[group["view_id"]][d["type"]]["llm_shape" if d["basis"] == "llm_shape" else "text_or_geometry"] += 1
+                    by_number[group["view_id"]][d["type"]]["llm_shape" if d["basis"] in AI_BASES else "text_or_geometry"] += 1
                 else:
                     unit.update({"type": None, "basis": None, "host_ref": None})
                     by_number[group["view_id"]]["UNTYPED"]["untyped"] += 1
@@ -868,7 +892,7 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
 
     summary: dict[str, dict[str, dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: {"text_or_geometry": 0, "llm_shape": 0}))
     for r in records:
-        summary[r["view_id"]][r["type"]]["llm_shape" if r["basis"] == "llm_shape" else "text_or_geometry"] += 1
+        summary[r["view_id"]][r["type"]]["llm_shape" if r["basis"] in AI_BASES else "text_or_geometry"] += 1
     unrecognised = [{"family": k, "occurrences": len(families[k]["occurrences"]), "size_mm": [round(v) for v in families[k]["size_mm"]], **{x: decisions[k].get(x) for x in ("reason", "votes", "rejected_type", "wrong_if")}}
                     for k in sorted(unrecognised_families)]
     row_summary = []
@@ -951,6 +975,15 @@ def equipment_markdown(result: dict[str, Any], views: list[dict[str, Any]]) -> s
             shares = "".join(f"，其中图块 {f['family'][:30]} 画的 {f['rows_counted']} 排" for f in row.get("also_drawn_by") or [] if f.get("rows_counted"))
             lines.append(f"成排画的{row['type_zh']}：{row['row_family'][:30]} {row['rows_counted']} 排{shares}，每排 {row['cells_per_row']} 格"
                          f"（{row['cell_size_mm'][0]}×{row['cell_size_mm'][1]} mm，节距 {float(row['pitch_mm']):.0f} mm），共 {row['cells_total']} 格；上表按排计。")
+    sc = result.get("stage_counts") or {}
+    if any(k.startswith("closer_look") for k in sc):
+        lines.append(f"细看（带工具的 AI 自己查图）：{sc.get('closer_look', 0)} 种，其中与第一遍一致 {sc.get('closer_look_agreed_first', 0)}、改判 {sc.get('closer_look_changed', 0)}、"
+                     f"仍拿不准 {sc.get('closer_look_unsure', 0)}；失败 {sc.get('closer_look_failed', 0)}、超预算未看 {sc.get('closer_look_over_budget', 0)}、无后端未看 {sc.get('closer_look_unavailable', 0)}。")
+        for k, f in sorted(result["families"].items()):
+            d = f.get("decision") or {}
+            if d.get("basis") == "agent_look":
+                lines.append(f"- {k[:30]}：{LABEL_ZH.get(d.get('type'), d.get('type'))}（{d.get('why')}；第一遍 {d.get('first_look', {}).get('type')}；"
+                             f"看了 {len(d.get('looked_at') or [])} 处证据，{d.get('tool_calls') or '?'} 步）：{(d.get('agent_reason') or d.get('reason') or '')[:120]}")
     if result.get("stated_quantities"):
         lines += ["", "图上写的数量与程序计数对照：", "", "| 视图 | 图上文字 | 图上写 | 程序数到 | 结论 |", "|---|---|---|---|---|"]
         for q in result["stated_quantities"]:

@@ -240,11 +240,11 @@ class ExtraVotesTest(unittest.TestCase):
         parsed = E.parse_tiles('{"tiles": [{"id": "T1", "type": "RACK", "reason": "rows", "wrong_if": "painted floor positions"}]}')
         self.assertEqual(parsed["T1"]["wrong_if"], "painted floor positions")
 
-    def test_a_high_count_family_without_a_majority_gets_extra_votes_with_the_earlier_reasons(self) -> None:
+    def test_a_family_is_asked_twice_and_a_split_vote_stays_disagreed_for_the_closer_look(self) -> None:
         occurrences = [{"ref": f"o{i}", "bbox": [i * 1200.0, 0.0, i * 1200.0 + 1000.0, 500.0], "footprint": [[i * 1200.0, 0.0], [i * 1200.0 + 1000.0, 0.0], [i * 1200.0 + 1000.0, 500.0], [i * 1200.0, 500.0]],
                         "parent_ref": None, "view_id": "V1"} for i in range(60)]
         fam = {"family": "BAY", "size_mm": (1000.0, 500.0), "occurrences": occurrences, "parents": Counter(), "children": Counter(), "views": {"V1"}, "texts_inside": []}
-        answers = iter([("RACK", "rows"), ("UNSURE", "plain box"), ("COMPONENT", "a beam"), ("RACK", "the row and pitch say racking"), ("RACK", "agree with the first")])
+        answers = iter([("RACK", "rows"), ("UNSURE", "plain box")])
         prompts = []
 
         def transport(prompt, image, call_dir):
@@ -255,18 +255,17 @@ class ExtraVotesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(E, "render_sheet", return_value="sha"):
             arrays = [{"family": "BAY", "count": 60, "pitch_mm": 1200.0, "along": "length"}]
             out = E.judge_shapes(None, {"BAY": fam}, ["BAY"], [], 1.0, Path(tmp), transport, True, arrays=arrays)
-        self.assertEqual(len(prompts), E.SPLIT_JUDGE_REPEATS + 2)
+        self.assertEqual(len(prompts), E.TYPE_JUDGE_VOTES, "two votes, no extra round: a split vote goes to the closer look (2026-10-25)")
         self.assertIn("arrangement: 60 identical copies", prompts[0])
-        self.assertNotIn("earlier judgements: RACK", prompts[2])
-        self.assertIn("earlier judgements: RACK (rows) | UNSURE (plain box) | COMPONENT (a beam)", prompts[3])
+        self.assertTrue(all("earlier judgements" not in p.split("Facts per tile:")[1] for p in prompts), "no earlier votes shown: there is no extra round")
         j = out["BAY"]
-        self.assertEqual((j["status"], j["type"], len(j["votes"])), ("agreed", "RACK", 5))
+        self.assertEqual((j["status"], j["type"], j["votes"]), ("disagreed", None, ["RACK", "UNSURE"]))
         self.assertEqual(j["wrong_if"][0], "if the boxes are floor markings")
 
-    def test_a_small_family_is_not_asked_again(self) -> None:
+    def test_two_votes_only_even_for_a_small_family(self) -> None:
         fam = {"family": "ONE", "size_mm": (1000.0, 500.0), "occurrences": [{"ref": "o1", "bbox": [0.0, 0.0, 1000.0, 500.0], "footprint": [], "parent_ref": None, "view_id": "V1"}],
                "parents": Counter(), "children": Counter(), "views": {"V1"}, "texts_inside": []}
-        answers = iter(["RACK", "UNSURE", "COMPONENT"])
+        answers = iter(["RACK", "UNSURE"])
         calls = []
 
         def transport(prompt, image, call_dir):
@@ -275,7 +274,7 @@ class ExtraVotesTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(E, "render_sheet", return_value="sha"):
             out = E.judge_shapes(None, {"ONE": fam}, ["ONE"], [], 1.0, Path(tmp), transport, True)
-        self.assertEqual((len(calls), out["ONE"]["status"]), (3, "disagreed"))
+        self.assertEqual((len(calls), out["ONE"]["status"]), (2, "disagreed"))
 
 
 class ResultFileTest(unittest.TestCase):

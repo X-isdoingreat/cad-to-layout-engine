@@ -29,6 +29,8 @@ def step_of(path: Path, out: Path) -> str:
         return "厂房读图"
     if "/split/" in "/" + rel or "split" in path.parts:
         return "设备：视图切分判官"
+    if "closer_look" in path.parts:
+        return "设备：细看"
     if "type_judge" in path.parts:
         return "设备：类型判官"
     return "其他"
