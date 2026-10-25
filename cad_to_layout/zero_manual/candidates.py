@@ -37,6 +37,10 @@ from .constants import (
     EQUIPMENT_MIN_SIZE_MM,
     NUMBER_SERIES_MIN_DISTINCT_SHARE,
     NUMBER_SERIES_MIN_MEMBERS,
+    ROW_CELL_AREA_SHARE_MIN,
+    ROW_KIND_DEPTH_TOLERANCE,
+    ROW_KIND_PITCH_TOLERANCE,
+    ROW_SPAN_MIN,
     ZONE_CLUSTER_GAP_MM,
     ZONE_MIN_MEMBERS,
 )
@@ -167,6 +171,97 @@ def regular_arrays(families: dict[str, dict[str, Any]], scale: float) -> list[di
                     "bbox": [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)],
                 })
     return arrays
+
+
+def row_blocks(families: dict[str, dict[str, Any]], arrays: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Block families that are one row of cells: the regular arrays of one child kind inside one occurrence of the block,
+    taken together, span at least ROW_SPAN_MIN of the block's long side and cover at least ROW_CELL_AREA_SHARE_MIN of its
+    area.  {row family: cell family, cells per row, pitch, groups, ...}.  The cells of a row are often drawn in several
+    groups (bays of a few cells with a divider between them, two lines back to back), so the arrays are summed first.
+    Several kinds qualifying in one block: the kind covering the most area is the cells, the others are the row's parts."""
+
+    parent_of: dict[str, tuple[str, dict[str, Any]]] = {}
+    for key, fam in families.items():
+        for occ in fam["occurrences"]:
+            parent_of[occ["ref"]] = (key, occ)
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for a in arrays:
+        if a["parent_ref"] and a["parent_ref"] in parent_of and parent_of[a["parent_ref"]][0] != a["family"]:
+            grouped[(a["parent_ref"], a["family"])].append(a)
+    rows: dict[str, dict[str, Any]] = {}
+    for (parent_ref, cell_key), group in sorted(grouped.items()):
+        row_key, parent = parent_of[parent_ref]
+        pb = parent["bbox"]
+        boxes = [a["bbox"] for a in group]
+        union = [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+        long_side = max(pb[2] - pb[0], pb[3] - pb[1])
+        span = max(union[2] - union[0], union[3] - union[1]) / long_side if long_side > 0 else 0.0
+        count = sum(a["count"] for a in group)
+        cell = families[cell_key]["size_mm"]
+        row_size = families[row_key]["size_mm"]
+        area = row_size[0] * row_size[1]
+        share = count * cell[0] * cell[1] / area if area > 0 else 0.0
+        if span < ROW_SPAN_MIN or share < ROW_CELL_AREA_SHARE_MIN:
+            continue
+        pitch = Counter(a["pitch_mm"] for a in group).most_common(1)[0][0]
+        along = Counter(a["along"] for a in group).most_common(1)[0][0]
+        found = {"row_family": row_key, "cell_family": cell_key, "cells_per_row": count, "groups": len(group), "pitch_mm": pitch, "along": along,
+                 "cell_size_mm": [round(v) for v in cell], "span": round(span, 3), "cell_area_share": round(share, 3)}
+        best = rows.get(row_key)
+        if best is None or (found["cell_area_share"], found["cells_per_row"]) > (best["cell_area_share"], best["cells_per_row"]):
+            rows[row_key] = found
+    return rows
+
+
+def row_kinds(rows: dict[str, dict[str, Any]], families: dict[str, dict[str, Any]], scale: float) -> dict[str, str]:
+    """Rows of one kind drawn by different blocks (a bank of shelving finished with a differently named block): the same
+    cells per row and groups, pitches within ROW_KIND_PITCH_TOLERANCE and depths within ROW_KIND_DEPTH_TOLERANCE.  The block
+    with the most copies leads the kind and is the one asked about; {follower row family: leader row family}.  The leader's
+    row info gains `also_drawn_by` (each follower: copies, cell block and size, depth, the distance from its nearest copy to
+    a copy of the leader -- all printed for the judge) and `kind_occurrences` (copies of the whole kind)."""
+
+    def depth(key: str) -> float:
+        return min(families[key]["size_mm"])
+
+    leaders: list[str] = []
+    follower_of: dict[str, str] = {}
+    for key in sorted(rows, key=lambda k: (-len(families[k]["occurrences"]), k)):
+        info = rows[key]
+        for lead in leaders:
+            li = rows[lead]
+            pitch, lead_pitch = float(info["pitch_mm"]), float(li["pitch_mm"])
+            if (info["cells_per_row"], info["groups"]) != (li["cells_per_row"], li["groups"]):
+                continue
+            if abs(pitch - lead_pitch) > ROW_KIND_PITCH_TOLERANCE * max(pitch, lead_pitch):
+                continue
+            if min(depth(key), depth(lead)) < (1.0 - ROW_KIND_DEPTH_TOLERANCE) * max(depth(key), depth(lead)):
+                continue
+            follower_of[key] = lead
+            li.setdefault("also_drawn_by", []).append({
+                "family": key, "occurrences": len(families[key]["occurrences"]), "cell_family": info["cell_family"], "cell_size_mm": info["cell_size_mm"],
+                "pitch_mm": info["pitch_mm"], "depth_mm": round(depth(key)),
+                "nearest_gap_mm": _nearest_gap_mm(families[key]["occurrences"], families[lead]["occurrences"], scale)})
+            break
+        else:
+            leaders.append(key)
+    for lead in leaders:
+        rows[lead]["kind_occurrences"] = len(families[lead]["occurrences"]) + sum(f["occurrences"] for f in rows[lead].get("also_drawn_by", []))
+    return follower_of
+
+
+def _nearest_gap_mm(a: list[dict[str, Any]], b: list[dict[str, Any]], scale: float) -> int:
+    """The smallest gap between a bounding box of `a` and one of `b`, in mm (0 when they touch or overlap; -1 without boxes)."""
+
+    best = math.inf
+    for oa in a:
+        for ob in b:
+            pa, pb = oa.get("bbox"), ob.get("bbox")
+            if not pa or not pb:
+                continue
+            dx = max(0.0, pa[0] - pb[2], pb[0] - pa[2])
+            dy = max(0.0, pa[1] - pb[3], pb[1] - pa[3])
+            best = min(best, math.hypot(dx, dy))
+    return round(best * scale) if best < math.inf else -1
 
 
 # ---------------------------------------------------------------- closed rectangles

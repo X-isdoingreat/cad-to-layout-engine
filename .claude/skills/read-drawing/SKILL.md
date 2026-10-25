@@ -43,7 +43,8 @@ Read `<folder>/结果.json` first (`status_code`: `ok` / `failed` / `equipment_l
 - building: name, area, length × width, its status in words, and the `wrong_if` sentence (what would make the number
   wrong); for `undecided` give both numbers with their methods and say the red line is worth a look; for `failed` give
   the reason and no number;
-- equipment: the main types and counts on the plan shown;
+- equipment: the main types and counts on the plan shown; a kind drawn as rows is given as rows and cells, and rows of one kind drawn by several blocks are one kind (`drawn_by`, `cells_per_row`,
+  `cells` in `结果.json`), never as one added-up number;
 - how many places need confirmation (part 三) and how to reply (one sentence with the numbers);
 - what was not read (e.g. equipment drawn as loose lines or parts, other floors, height).
 Never call a number correct beyond its status: 与图上数字一致 and 两种方法一致 are system findings, 待定 is two numbers, not one.

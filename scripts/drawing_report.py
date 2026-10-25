@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from cad_to_layout.zero_manual.equipment import LABEL_ZH  # noqa: E402
-from scripts.equipment_review import COLOURS, WAREHOUSE_TYPES, _block_of, _index, _load, _matplotlib, _tile, items_of, not_counted  # noqa: E402
+from scripts.equipment_review import BLOCK_DRAWN, COLOURS, WAREHOUSE_TYPES, _block_of, _index, _load, _matplotlib, _tile, items_of, not_counted  # noqa: E402
 from scripts.trial_package import wrap_keep  # noqa: E402
 
 AI_SERVICE = "OpenAI" if os.environ.get("CTLE_AGENT", "claude").lower() == "codex" else "Anthropic"  # named in the report footer (claude and api both send to Anthropic)
@@ -59,6 +59,20 @@ def label(t: str) -> str:
 
 def unit(t: str) -> str:
     return UNIT.get(t, "台")
+
+
+def count_words(t: str, records: list[dict[str, Any]]) -> str:
+    """Single units first, rows after: '1,112 格' / '18 排（每排 57 格，共 1,026 格）' / both joined."""
+
+    rows = [r for r in records if r.get("drawn_as") == "row"]
+    singles = len(records) - len(rows)
+    parts = [f"{singles:,} {unit(t)}"] if singles else []
+    if rows:
+        per = sorted({int(r.get("cells") or 0) for r in rows})
+        parts.append(f"{len(rows):,} 排（每排 {'/'.join(f'{p:,}' for p in per if p)} {unit(t)}，共 {sum(int(r.get('cells') or 0) for r in rows):,} {unit(t)}）")
+    return "，另有成排 ".join(parts) if parts else "0"
+
+
 PICTURE = [0.02, 0.05, 0.63, 0.86]
 
 
@@ -196,6 +210,7 @@ def equipment_pages(pdf: Any, pyplot: Any, run: Path, building_at: list[float] |
     window = [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]  # zoomed to the equipment, not the whole sheet
     totals = Counter(r["type"] for r in counted)
     summary.update({"floor": title[main], "counts": Counter(r["type"] for r in main_records), "kinds": len(items),
+                    "count_words": {t: count_words(t, [r for r in main_records if r["type"] == t]) for t in {r["type"] for r in main_records}},
                     "by_text": sum(1 for r in main_records if r["basis"] == "text"), "records": len(main_records)})
 
     # overview
@@ -207,13 +222,14 @@ def equipment_pages(pdf: Any, pyplot: Any, run: Path, building_at: list[float] |
     lines = [(f"{title[main]}：彩色为系统识别出的设备，灰色为原图，未上色处为未识别。", 10.5, "normal"), ("", 0, "")]
     for t in WAREHOUSE_TYPES + ["OTHER_EQUIPMENT"]:
         if main_counts.get(t):
-            lines.append((f"■ {label(t)}　{main_counts[t]:,} {unit(t)}" + ("（可能含生产设备）" if t == "OTHER_EQUIPMENT" else ""), 12, "bold"))
+            lines.append((f"■ {label(t)}　{count_words(t, [r for r in main_records if r['type'] == t])}" + ("（可能含生产设备）" if t == "OTHER_EQUIPMENT" else ""), 12, "bold"))
     other_views = [v for v in per_view if v != main]
     if other_views:
         lines += [("", 0, ""), ("其他平面图：", 10.5, "bold")]
         for v in sorted(other_views, key=lambda v: -per_view[v])[:6]:
-            c = Counter(r["type"] for r in counted if r["view_id"] == v)
-            lines.append((f"· {title[v][:16]}：" + "、".join(f"{label(t)} {n:,}" for t, n in c.most_common(3)), 9.5, "normal"))
+            of_view = [r for r in counted if r["view_id"] == v]
+            c = Counter(r["type"] for r in of_view)
+            lines.append((f"· {title[v][:16]}：" + "、".join(f"{label(t)} {count_words(t, [r for r in of_view if r['type'] == t])}" for t, _ in c.most_common(3)), 9.5, "normal"))
         if len(other_views) > 6:
             lines.append((f"· 另有 {len(other_views) - 6} 张，见附录", 9.5, "normal"))
     lines += [("", 0, ""), ("数量由系统直接从图纸统计；剖面图、立面图及重复绘制的图纸不计入。", 9, "normal")]
@@ -231,14 +247,14 @@ def equipment_pages(pdf: Any, pyplot: Any, run: Path, building_at: list[float] |
         _boxes(axis, [r for r in main_records if r["type"] == t], lambda r: COLOURS.get(t, "#6b7280"), 0.65)
         kinds = [it for it in items if it["type"] == t]
         sample = kinds[0] if kinds else None
-        if sample and sample["drawn_as"] == "block":
+        if sample and sample["drawn_as"] in BLOCK_DRAWN:
             inset = figure.add_axes([0.70, 0.08, 0.26, 0.30])
             _tile(inset, doc, _block_of(inventory, equipment, sample["family"], sample["sample_ref"]))
             figure.text(0.70, 0.39, f"长这样（{sample['id']}，{sample['size_mm'][0]}×{sample['size_mm'][1]} mm）：", fontsize=10)
         basis = Counter("文字" if k["basis"] == "图上文字" else "形状" for k in kinds)
         _words(figure, f"{label(t)}", [
-            (f"{title[main]}：{main_counts[t]:,} {unit(t)}", 15, "bold"),
-            (f"全部平面图：{totals[t]:,} {unit(t)}", 12, "normal"), ("", 0, ""),
+            (f"{title[main]}：{count_words(t, [r for r in main_records if r['type'] == t])}", 15, "bold"),
+            (f"全部平面图：{count_words(t, [r for r in counted if r['type'] == t])}", 12, "normal"), ("", 0, ""),
             ("图中彩色为该类设备，浅灰为其他设备。", 10.5, "normal"),
             (f"共 {len(kinds)} 种样式（附录编号 {'、'.join(k['id'] for k in kinds[:8])}{'…' if len(kinds) > 8 else ''}）。", 10.5, "normal"),
             (f"识别方式：{'文字识别 ' + str(basis['文字']) + ' 种' if basis['文字'] else ''}{'；' if basis['文字'] and basis['形状'] else ''}{'形状识别 ' + str(basis['形状']) + ' 种' if basis['形状'] else ''}。", 10.5, "normal")])
@@ -334,7 +350,7 @@ def equipment_pages(pdf: Any, pyplot: Any, run: Path, building_at: list[float] |
         figure, axes = pyplot.subplots(3, 4, figsize=PAGE)
         figure.text(0.02, 0.955, "附录：设备样式明细", fontsize=14, weight="bold")
         for axis, it in zip(axes.flat, items[start:start + 12]):
-            _tile(axis, doc, _block_of(inventory, equipment, it["family"], it["sample_ref"]) if it["drawn_as"] == "block" else None)
+            _tile(axis, doc, _block_of(inventory, equipment, it["family"], it["sample_ref"]) if it["drawn_as"] in BLOCK_DRAWN else None)
             axis.set_title(f"{it['id']} {it['type_zh'] if it['type'] != 'UNRECOGNISED' else '未识别'}{('：' + it['name'][:10]) if it['name'] else ''}\n{it['count']:,} {unit(it['type'])}　{it['size_mm'][0]}×{it['size_mm'][1]} mm\n"
                            + ("文字识别" if it["basis"] == "图上文字" else ("形状识别" if it["type"] != "UNRECOGNISED" else "未识别")),
                            fontsize=8, loc="left")
@@ -440,7 +456,8 @@ def conclusion(pyplot: Any, drawing: str, area: dict[str, Any] | None, equipment
         rows.append(("厂房", f"{area['name'][:20]}：总面积 {area['area_m2']:,.0f} 平方米，长 {area.get('length_m', 0):.1f} × 宽 {area.get('width_m', 0):.1f} 米"
                      + (f"；状态：{area['status_zh']}" if area.get("status_zh") else "")))
     if equipment.get("counts"):
-        main = "、".join(f"{label(t)} {n:,} {unit(t)}" for t, n in equipment["counts"].most_common())[:80]
+        words = equipment.get("count_words") or {}
+        main = "、".join(f"{label(t)} {words.get(t) or f'{n:,} {unit(t)}'}" for t, n in equipment["counts"].most_common())[:120]
         rows.append(("设备", f"{equipment['floor']}：{main}（按设备图块统计）"
                      + ("。本图还有按重复图形统计的结果（下面“重复图形”一行）：散线画的设备按图块读不准，两者不一致时以重复图形和人工确认为准。"
                         if equipment.get("repeat") or equipment.get("repeat_doubted") else "")))

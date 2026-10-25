@@ -78,7 +78,8 @@ def write_result(out: Path, dwg: Path, building: str | None, area: Path | None, 
     if equipment is not None:
         e = _load(equipment / "equipment.json")
         counts = e.get("stage_counts") or {}
-        kinds = [{k: it.get(k) for k in ("id", "type", "type_zh", "name", "count", "basis", "wrong_if")} for it in _load_list(equipment / "review" / "review_items.json")]
+        kinds = [{k: it.get(k) for k in ("id", "type", "type_zh", "name", "count", "cells_per_row", "cells", "drawn_by", "basis", "wrong_if")}
+                 for it in _load_list(equipment / "review" / "review_items.json")]
         body["equipment"] = {"records": len(e.get("records") or []), "stage_counts": counts, "folder": str(equipment), "kinds": kinds,
                              "llm_all_failed": bool(counts) and counts.get("llm_skipped", 0) > 0 and not any(counts.get(k) for k in ("llm_agreed", "llm_unsure", "llm_disagreed"))}
         usage = []

@@ -36,6 +36,10 @@ SHEET_FRAME_SIZE_TOLERANCE = 0.005
 # (a whole plan placed as one block); its children are clustered instead of it.
 CONTAINER_EXPAND_MEDIAN_FACTOR = 20.0
 CONTAINER_MAX_DEPTH = 3
+# ...but a long block is a container only when it is big in both directions (short side also over the limit) or holds
+# at least this many different kinds of block.  A long thin block holding one kind of block (a row of racking, a conveyor
+# line) is equipment to be judged whole, never opened and dismissed unseen.
+CONTAINER_MIN_FAMILIES = 3
 # A paper viewport counts as a sheet's main view only if it shows at least this
 # many top-level objects; among those, the one covering the largest model area wins.
 VIEW_MAIN_MIN_CONTENT = 10
@@ -74,6 +78,16 @@ ARRAY_ALIGN_TOLERANCE_MM = 10.0
 # when the pitch is at most this factor of the module size along the line; machines
 # standing apart with aisles between them are not modules of one group.
 ARRAY_MAX_PITCH_SIZE_RATIO = 2.0
+# A block whose children of one kind form one regular array spanning at least ROW_SPAN_MIN of its long side and covering
+# at least ROW_CELL_AREA_SHARE_MIN of its area is a row: the row is judged as one unit, those children are its cells (bays,
+# positions, segments) and are never asked about alone; the count is given as rows and cells.
+ROW_SPAN_MIN = 0.8
+ROW_CELL_AREA_SHARE_MIN = 0.25
+# Rows of one kind drawn by different blocks (a bank of shelving finished with a differently named block): the same cells
+# per row and groups, pitches within ROW_KIND_PITCH_TOLERANCE of each other and depths within ROW_KIND_DEPTH_TOLERANCE are
+# one kind; the block with the most copies is asked once and the others take its answer (2026-10-25).
+ROW_KIND_PITCH_TOLERANCE = 0.05
+ROW_KIND_DEPTH_TOLERANCE = 0.25
 # Closed rectangles are cells of one group when they share a full edge (ends within
 # this distance); a cell is between these side lengths (a rack bay or shelf cell,
 # not a bolt hole and not a room).

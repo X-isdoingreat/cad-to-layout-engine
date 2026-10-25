@@ -30,6 +30,13 @@ class EquipmentReviewTest(unittest.TestCase):
         self.assertEqual([(i["id"], i["family"], i["count"]) for i in items], [("E01", "bay", 3), ("E02", "arm", 1)])
         self.assertEqual(items[0]["basis"], "AI 看图（3/3 次一致）")
 
+    def test_rows_of_one_kind_drawn_by_two_blocks_are_one_item(self) -> None:
+        row = {"drawn_as": "row", "cells": 24, "row_kind": "bank"}
+        records = [{**_record("P", "bank"), **row}] * 57 + [{**_record("P", "end"), **row}] * 4
+        equipment = {"records": records, "duplicate_views": [], "families": {"bank": {"decision": {"votes": ["RACK"] * 3}}}, "unrecognised": []}
+        items = items_of(equipment, _views())
+        self.assertEqual([(i["family"], i["count"], i["cells"], i["drawn_by"]) for i in items], [("bank", 61, 1464, {"bank": 57, "end": 4})])
+
 
 class RepeatReplyTest(unittest.TestCase):
     """A one-sentence reply on groups counted by repeated linework: R-first is the program's own count, later groups

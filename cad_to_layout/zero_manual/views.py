@@ -23,6 +23,7 @@ from shapely.strtree import STRtree
 from .constants import (
     CONTAINER_EXPAND_MEDIAN_FACTOR,
     CONTAINER_MAX_DEPTH,
+    CONTAINER_MIN_FAMILIES,
     SHEET_FRAME_SIZE_TOLERANCE,
     STANDARD_DRAWING_SCALES,
     STANDARD_PAPER_MM,
@@ -176,20 +177,30 @@ def inventory_boxes(inventory: dict[str, Any]):
 
 
 def _open_containers(boxes: list[tuple[str, list[float]]], inventory: dict[str, Any]) -> tuple[list[tuple[str, list[float]]], list[str]]:
-    """Replace oversized container INSERTs by their children (up to CONTAINER_MAX_DEPTH levels)."""
+    """Replace oversized container INSERTs by their children (up to CONTAINER_MAX_DEPTH levels).
+
+    Oversized: the long side is over CONTAINER_EXPAND_MEDIAN_FACTOR times the median.  A container is also big across (short
+    side over the same limit) or holds at least CONTAINER_MIN_FAMILIES kinds of block.  A long thin block holding one kind of
+    block, or none (a row of racking, a conveyor line), is not opened: it is equipment, judged whole."""
 
     sizes = [max(b[2] - b[0], b[3] - b[1]) for _, b in boxes]
     positive = [v for v in sizes if v > 0]
     if not positive:
         return boxes, []
     limit = statistics.median(positive) * CONTAINER_EXPAND_MEDIAN_FACTOR
+    kinds: dict[str, set[str]] = {}
+    for row in inventory["occurrences"]:
+        if row["parent_ref"]:
+            kinds.setdefault(row["parent_ref"], set()).add(row["original_block"])
     index: dict[str, list[tuple[str, list[float]]]] | None = None
     opened: list[str] = []
     result: list[tuple[str, list[float]]] = []
     stack = [(ref, b, 0) for ref, b in boxes]
     while stack:
         ref, b, level = stack.pop()
-        if ref.startswith("I:") and level < CONTAINER_MAX_DEPTH and max(b[2] - b[0], b[3] - b[1]) > limit:
+        long_side, short_side = max(b[2] - b[0], b[3] - b[1]), min(b[2] - b[0], b[3] - b[1])
+        container = long_side > limit and (short_side > limit or len(kinds.get(ref, ())) >= CONTAINER_MIN_FAMILIES)
+        if ref.startswith("I:") and level < CONTAINER_MAX_DEPTH and container:
             if index is None:
                 index = _children_index(inventory)
             children = index.get(ref, [])

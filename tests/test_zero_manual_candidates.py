@@ -88,19 +88,24 @@ class RegularArrayTests(CandidateCase):
         msp.add_blockref(outer_name, (0, 20000))
         return doc
 
-    def test_packed_modules_are_counted_and_the_llm_typed_outer_block_is_not(self) -> None:
-        result = self._recognise(self._nested("outer"), {"bay": "RACK", "row": "COMPONENT", "outer": "OTHER_EQUIPMENT"})
-        kinds = Counter((r["type"], r["family"]) for r in result["records"])
-        self.assertEqual(kinds, {("RACK", "bay"): 40})
+    def test_a_row_of_packed_cells_is_counted_as_rows_and_cells_and_the_llm_typed_outer_block_is_not(self) -> None:
+        # 2026-10-24: the row block is judged as one unit; its cells are never asked about alone (they inherit)
+        result = self._recognise(self._nested("outer"), {"row": "RACK", "outer": "OTHER_EQUIPMENT"})
+        self.assertEqual(self.judge.asked, {"row", "outer"})
+        kinds = Counter((r["type"], r["family"], r["drawn_as"], r.get("cells")) for r in result["records"])
+        self.assertEqual(kinds, {("RACK", "row", "row", 10): 4})
+        self.assertEqual(result["families"]["bay"]["decision"]["basis"], "row_structure")
+        self.assertEqual(result["cell_occurrences_counted_through_rows"], 40)
+        self.assertEqual([(r["rows_counted"], r["cells_per_row"], r["cells_total"], r["type"]) for r in result["rows"]], [(4, 10, 40, "RACK")])
         self.assertEqual(len(result["assemblies_not_counted"]), 2)
         self.assertEqual(sorted(a["count"] for a in result["regular_arrays"] if a["family"] == "bay"), [10, 10, 10, 10])
         self.assertTrue(all(r["status"] == "pending_independent_count_and_spot_check" for r in result["records"]))
 
-    def test_a_text_named_outer_machine_keeps_its_modules_uncounted(self) -> None:
-        result = self._recognise(self._nested("堆垛机"), {"bay": "RACK", "row": "COMPONENT"})
+    def test_a_text_named_outer_machine_keeps_its_rows_uncounted(self) -> None:
+        result = self._recognise(self._nested("堆垛机"), {"row": "RACK"})
         kinds = Counter((r["type"], r["family"]) for r in result["records"])
         self.assertEqual(kinds, {("STACKER", "堆垛机"): 2})
-        self.assertEqual(result["nested_occurrences_not_recounted"], 40)
+        self.assertEqual(result["nested_occurrences_not_recounted"], 4)
 
     def test_machines_standing_apart_are_not_a_packed_array(self) -> None:
         doc = _new()

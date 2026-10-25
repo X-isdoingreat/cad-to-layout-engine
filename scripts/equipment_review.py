@@ -77,19 +77,22 @@ def items_of(equipment: dict[str, Any], views: dict[str, Any]) -> list[dict[str,
     copies = not_counted(equipment, views)
     by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in equipment["records"]:
-        by_family[r["family"]].append(r)
+        by_family[r.get("row_kind") or r["family"]].append(r)  # rows of one kind drawn by several blocks: one item, under the block asked
     items = []
     for family, records in by_family.items():
-        first = records[0]
+        first = next((r for r in records if r["family"] == family), records[0])
         sizes = sorted((r["length_mm"], r["width_mm"]) for r in records)
         per_view = Counter(r["view_id"] for r in records)
         decision = (equipment["families"].get(family) or {}).get("decision") or {}
         votes = decision.get("votes") or []
+        cells = sum(r.get("cells") or 0 for r in records if r["view_id"] not in copies)  # a row is one record; its cells are the second level
         items.append({"family": family, "type": first["type"], "type_zh": first["type_zh"], "name": first.get("name") or "",
                       "basis": "图上文字" if first["basis"] == "text" else (f"AI 看图（{Counter(votes).most_common(1)[0][1]}/{len(votes)} 次一致）" if votes else "AI 看图"),
                       "wrong_if": decision.get("wrong_if") or "",
                       "drawn_as": first.get("drawn_as", "block"), "sample_ref": first["ref"],
                       "count": sum(n for v, n in per_view.items() if v not in copies), "per_view": dict(per_view),
+                      "cells_per_row": first.get("cells"), "cells": cells or None,
+                      "drawn_by": dict(Counter(r["family"] for r in records)) if any(r["family"] != family for r in records) else None,
                       "size_mm": [round(v) for v in sizes[len(sizes) // 2]], "warehouse": first["type"] in WAREHOUSE_TYPES})
     for u in equipment.get("unrecognised") or []:
         if u["occurrences"] >= UNRECOGNISED_MIN_OCCURRENCES and u["family"] not in by_family:
@@ -100,6 +103,15 @@ def items_of(equipment: dict[str, Any], views: dict[str, Any]) -> list[dict[str,
     for n, it in enumerate(items, 1):
         it["id"] = f"E{n:02d}"
     return items
+
+
+BLOCK_DRAWN = {"block", "row", "loose_cell"}  # kinds whose sample is a block definition (a tile can be drawn)
+
+
+def count_text(it: dict[str, Any]) -> str:
+    """'18 排×57 格＝1026 格' for a kind drawn as rows, '18 个' otherwise."""
+
+    return f"{it['count']} 排×{it['cells_per_row']} 格＝{it['cells']} 格" if it.get("cells") else f"{it['count']} 个"
 
 
 def _block_of(inventory: dict[str, Any], equipment: dict[str, Any], family: str, sample_ref: str | None) -> str | None:
@@ -239,8 +251,8 @@ def make(args: argparse.Namespace) -> int:
             figure, axes = pyplot.subplots(4, 3, figsize=(8.27, 11.69))
             figure.suptitle("每种设备（看小图和类型对不对）", fontsize=13, x=0.06, ha="left", y=0.985)
             for axis, it in zip(axes.flat, items[start:start + TILES_PER_PAGE]):
-                _tile(axis, doc, _block_of(inventory, equipment, it["family"], it["sample_ref"]) if it["drawn_as"] == "block" else None)
-                label = f"{it['id']}  {it['type_zh']}{('：' + it['name'][:14]) if it['name'] else ''}\n{it['count']} 个　{it['size_mm'][0]}×{it['size_mm'][1]} mm\n{it['basis']}"
+                _tile(axis, doc, _block_of(inventory, equipment, it["family"], it["sample_ref"]) if it["drawn_as"] in BLOCK_DRAWN else None)
+                label = f"{it['id']}  {it['type_zh']}{('：' + it['name'][:14]) if it['name'] else ''}\n{count_text(it)}　{it['size_mm'][0]}×{it['size_mm'][1]} mm\n{it['basis']}"
                 axis.set_title(label, fontsize=8, loc="left")
             for axis in list(axes.flat)[len(items[start:start + TILES_PER_PAGE]):]:
                 axis.axis("off")
@@ -268,7 +280,7 @@ def make(args: argparse.Namespace) -> int:
         w = csv.writer(f)
         w.writerow(["编号", "类型（程序）", "名称", "依据", "台数（不含重复视图）", "单台长×宽 mm", "图块", "复查（对 / 不是设备 / 正确类型）"])
         for it in items:
-            w.writerow([it["id"], it["type_zh"], it["name"], it["basis"], it["count"], f"{it['size_mm'][0]}×{it['size_mm'][1]}", it["family"], ""])
+            w.writerow([it["id"], it["type_zh"], it["name"], it["basis"], count_text(it), f"{it['size_mm'][0]}×{it['size_mm'][1]}", it["family"], ""])
         w.writerow(["漏了的地方", "", "", "", "", "", "", ""])
     (review / "review_items.json").write_text(json.dumps({"made_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "items": items},
                                                          ensure_ascii=False, indent=1), encoding="utf-8")

@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
-from .candidates import bind_texts, number_series, outline_cell_groups, regular_arrays
+from .candidates import bind_texts, number_series, outline_cell_groups, regular_arrays, row_blocks, row_kinds
 from .constants import (
     BACKGROUND_MIN_FAMILIES,
     BACKGROUND_ONCE_ONLY_SHARE,
@@ -258,9 +258,10 @@ def _nearby_texts(fam: dict[str, Any], texts: list[dict[str, Any]], scale: float
 
 
 def facts_line(tile_id: str, fam: dict[str, Any], nearby: list[str], array: dict[str, Any] | None = None,
-               earlier: list[tuple[str, str]] | None = None) -> str:
+               earlier: list[tuple[str, str]] | None = None, row: dict[str, Any] | None = None) -> str:
     """The printed facts of one tile; `array` is the family's largest regular row (how the block is laid out: racks come in
-    rows, conveyors end to end), `earlier` the (type, reason) pairs of judgements already given for this tile (extra votes)."""
+    rows, conveyors end to end), `earlier` the (type, reason) pairs of judgements already given for this tile (extra votes),
+    `row` the cells this block holds when it is itself one row (judged as one unit; its cells are never asked about alone)."""
 
     L, W = fam["size_mm"]
     parents = ", ".join(n for n, _ in fam["parents"].most_common(2)) or "none (top level)"
@@ -271,6 +272,17 @@ def facts_line(tile_id: str, fam: dict[str, Any], nearby: list[str], array: dict
     extra = ""
     if array:
         extra += f"; arrangement: {array['count']} identical copies in one straight row, pitch {float(array['pitch_mm']):.0f} mm along the block's {array['along']}"
+    if row:
+        groups = f" in {row['groups']} groups" if row.get("groups", 1) > 1 else ""
+        extra += (f"; THIS BLOCK IS ONE ROW: it holds {row['cells_per_row']} identical cells ({row['cell_family'][:20]}, "
+                  f"{row['cell_size_mm'][0]} x {row['cell_size_mm'][1]} mm) at {float(row['pitch_mm']):.0f} mm pitch along its {row['along']}{groups}, "
+                  "spanning the block. Judge the row as one unit (a row of racking bays, a conveyor line of segments, ...); its cells are "
+                  "its bays or segments, and a row placed inside a bigger block is still a row, not a COMPONENT")
+        for other in row.get("also_drawn_by") or []:  # the same kind of row under another block name: the judge is told, not asked twice
+            extra += (f". The same kind of row is also drawn by block {other['family'][:40]}: {other['occurrences']} copies, cells {other['cell_family'][:20]} "
+                      f"{other['cell_size_mm'][0]} x {other['cell_size_mm'][1]} mm, the same {row['cells_per_row']} cells{groups} at {float(other['pitch_mm']):.0f} mm pitch, "
+                      f"{other['depth_mm']} mm deep; its nearest copy stands {max(other['nearest_gap_mm'], 0) / 1000:.1f} m from a copy of this block. "
+                      "One answer covers both blocks")
     if earlier:
         extra += "; earlier judgements: " + " | ".join(f"{t} ({r[:80]})" if r else t for t, r in earlier)
     return (f"{tile_id}: size {L:.0f} x {W:.0f} mm; occurs {len(fam['occurrences'])} times in {views} view(s), "
@@ -382,7 +394,8 @@ def parse_tiles(text: str) -> dict[str, dict[str, Any]] | None:
 
 def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[str], texts: list[dict[str, Any]], scale: float,
                  work_dir: Path, transport: Callable | None, allow_external: bool, replay: Path | None = None,
-                 all_boxes: list[list[float]] | None = None, start: int = 0, arrays: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+                 all_boxes: list[list[float]] | None = None, start: int = 0, arrays: list[dict[str, Any]] | None = None,
+                 row_info: dict[str, dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
     """Returns {family: {"status": agreed|disagreed|skipped, "type", "votes", "reasons", "wrong_if", "sheet", "tile_id"}}.
 
     Every sheet is asked SPLIT_JUDGE_REPEATS times.  A family that occurs at least HIGH_COUNT_KIND_MIN times decides a large part
@@ -445,7 +458,8 @@ def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[
             random.Random(ask_index).shuffle(order)  # real variation between asks: tile layout and fact order
             image = sheet_dir / f"ask_{ask_index}.png"
             image_sha = render_sheet(doc, order, image, surroundings)
-            facts = "\n".join(facts_line(tid, fam, nearby[tid], array_info.get(fam["family"]), earlier.get(tid)) for tid, fam in order)
+            facts = "\n".join(facts_line(tid, fam, nearby[tid], array_info.get(fam["family"]), earlier.get(tid), (row_info or {}).get(fam["family"]))
+                              for tid, fam in order)
             prompt = GUIDANCE + "\n\nFacts per tile:\n" + facts
             (sheet_dir / f"ask_{ask_index}_prompt.txt").write_text(prompt, encoding="utf-8")
             call_dir = sheet_dir / f"ask_{ask_index}"
@@ -465,7 +479,8 @@ def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[
             for ask_index in range(1, SPLIT_JUDGE_REPEATS + 1):
                 ask_once(ask_index, {})
             # a high-count family without a majority: more votes, with the earlier judgements and their reasons shown
-            if any(len(fam["occurrences"]) >= HIGH_COUNT_KIND_MIN and _majority(votes[tid])[0] is None for tid, fam in tiles):
+            if any(max(len(fam["occurrences"]), (row_info or {}).get(fam["family"], {}).get("kind_occurrences", 0)) >= HIGH_COUNT_KIND_MIN
+                   and _majority(votes[tid])[0] is None for tid, fam in tiles):
                 for extra in range(1, TYPE_JUDGE_EXTRA_VOTES + 1):
                     earlier = {tid: list(zip(votes[tid], reasons[tid])) for tid, _ in tiles if votes[tid]}
                     ask_once(SPLIT_JUDGE_REPEATS + extra, earlier)
@@ -486,11 +501,15 @@ def judge_shapes(doc: Any, families: dict[str, dict[str, Any]], undecided: list[
 
 
 # ---------------------------------------------------------------- stage 3: checks and records
-def size_plausible(kind: str, size_mm: tuple[float, float]) -> bool:
+def size_plausible(kind: str, size_mm: tuple[float, float], row: bool = False) -> bool:
+    """A row is as long as its cells make it: only its depth (short side) is held against the type's width range."""
+
     ranges = TYPE_SIZE_RANGES_MM.get(kind)
     if ranges is None:
         return True
     (l_lo, l_hi), (w_lo, w_hi) = ranges
+    if row:
+        return w_lo <= size_mm[1] <= w_hi
     return l_lo <= size_mm[0] <= l_hi and w_lo <= size_mm[1] <= w_hi
 
 
@@ -508,15 +527,25 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
     if inventory["anonymous_names_grouped"]:
         stage_counts["anonymous_names_grouped"] = inventory["anonymous_names_grouped"]
         stage_counts["anonymous_groups"] = inventory["anonymous_groups"]
-    for key, fam in families.items():
-        d = rule_decision(fam)
-        if d is not None:
-            decisions[key] = {**d, "stage": "rules"}
-            stage_counts["rules"] += 1
-
     # --- candidates that are not "one block = one machine" (no LLM)
     arrays = regular_arrays(families, scale)
     array_of = {ref: index for index, a in enumerate(arrays) for ref in a["members"]}
+    # a block holding one kind of cell in a regular array that spans it is a row: judged as one unit, its cells through it
+    rows = row_blocks(families, arrays)
+    # rows of one kind drawn by different blocks: the block with the most copies is asked, the others follow its answer
+    follower_of = row_kinds(rows, families, scale)
+    cell_rows: dict[str, list[str]] = defaultdict(list)
+    for info in rows.values():
+        cell_rows[info["cell_family"]].append(info["row_family"])
+    for key, fam in families.items():
+        d = rule_decision(fam)
+        if d is None:
+            continue
+        if key in cell_rows and d["basis"] == "geometry" and d["evidence"][0]["kind"] == "size_rule":
+            stage_counts["cell_size_rule_waived"] += 1  # a cell is judged through its row, however small it is
+            continue
+        decisions[key] = {**d, "stage": "rules"}
+        stage_counts["rules"] += 1
     cell_groups = outline_cell_groups(inventory["closed_outlines"], views, scale, opened_set)
     cell_classes: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for group in cell_groups:
@@ -564,6 +593,47 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
             found.add(parent["original_block"] if parent is not None and parent["original_block"] in families else None)
         parents[key] = found
 
+    # --- rows: cells named by a text name their row without a judge; a row's other children are its parts
+    for row_key, info in rows.items():
+        cell = decisions.get(info["cell_family"])
+        if row_key not in decisions and cell is not None and cell["basis"] == "text" and cell["type"] in EQUIPMENT_TYPES:
+            decisions[row_key] = {"type": cell["type"], "basis": "text", "stage": "rules", "name": cell.get("name", ""),
+                                  "evidence": [{"kind": "row_of_text_named_cells", **info}]}
+            stage_counts["row_from_named_cells"] += 1
+        for child in families[row_key]["children"]:
+            if child != info["cell_family"] and child not in decisions and child not in rows and parents.get(child) and all(p in rows for p in parents[child]):
+                decisions[child] = {"type": "COMPONENT", "basis": "geometry", "stage": "rules", "evidence": [{"kind": "part_of_a_row", "row": row_key}]}
+                stage_counts["part_of_row"] += 1
+
+    def decide_followers() -> None:
+        """A row of the same kind as a judged row, drawn by another block, takes that row's answer: one kind, one question."""
+
+        for key, lead in follower_of.items():
+            if key in decisions or lead not in decisions:
+                continue
+            source = decisions[lead]
+            wrong = "; or ".join([w for w in [source.get("wrong_if") or ""] if w] + [f"{key[:40]} is not the same kind of row as {lead[:40]}"])
+            decisions[key] = {"type": source["type"], "basis": "row_kind", "via": source["basis"], "stage": "rules", "name": source.get("name", ""),
+                              "same_kind_as": lead, "votes": source.get("votes"), "reason": "row_kind_not_recognised" if source["type"] == "UNRECOGNISED" else None,
+                              "wrong_if": wrong, "evidence": [{"kind": "same_row_kind_as", "row": lead, **{k: rows[key][k] for k in ("cells_per_row", "groups", "pitch_mm")}}]}
+
+    def decide_cells() -> None:
+        """A cell family takes its rows' type once every row holding it is decided; cells are never judged alone."""
+
+        decide_followers()  # a follower row is decided with the leader of its kind; its cells then follow it
+        for cell_key, row_keys in cell_rows.items():
+            if cell_key in decisions or any(r not in decisions for r in row_keys):
+                continue
+            # the type of the recognised rows holding it (the most common; sorted order on a tie); unrecognised only when none is
+            kinds = Counter(decisions[r]["type"] for r in sorted(row_keys) if decisions[r]["type"] != "UNRECOGNISED")
+            kind = kinds.most_common(1)[0][0] if kinds else "UNRECOGNISED"
+            source = next(decisions[r] for r in sorted(row_keys) if decisions[r]["type"] == kind)
+            decisions[cell_key] = {"type": kind, "basis": "row_structure", "via": source.get("via") or source["basis"], "stage": "rules", "name": source.get("name", ""),
+                                   "rows": sorted(row_keys), "reason": "row_not_recognised" if kind == "UNRECOGNISED" else None, "wrong_if": source.get("wrong_if", ""),
+                                   "evidence": [{"kind": "cells_of_a_row", "rows": sorted(row_keys)}]}
+
+    decide_cells()
+
     # a pasted background drawing: its once-only blocks are listed, not judged
     below: dict[str, set[str]] = defaultdict(set)
     for key, fam in families.items():
@@ -595,10 +665,10 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
 
     array_families = {a["family"] for a in arrays}
     all_boxes = [o["bbox"] for o in inventory["occurrences"] if o["bbox"]]
-    pending = {k for k in families if k not in decisions}
+    pending = {k for k in families if k not in decisions and k not in cell_rows and k not in follower_of}  # cells and follower rows are decided through their rows / kind
     start = 0
     while pending:
-        ready = sorted(k for k in pending if k in array_families or any(p is None or holds_machines(p) is True for p in parents[k]))
+        ready = sorted(k for k in pending if k in array_families or k in rows or any(p is None or holds_machines(p) is True for p in parents[k]))
         parts = sorted(k for k in pending if k not in ready and all(p is not None and holds_machines(p) is False for p in parents[k]))
         for key in parts:
             decisions[key] = {"type": "COMPONENT", "basis": "geometry", "stage": "rules",
@@ -609,7 +679,8 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
             if parts:
                 continue
             break
-        judged = judge_shapes(doc, families, ready, inventory["texts"], scale, work_dir / "type_judge", transport, allow_external, replay, all_boxes, start, arrays=arrays)
+        judged = judge_shapes(doc, families, ready, inventory["texts"], scale, work_dir / "type_judge", transport, allow_external, replay, all_boxes, start,
+                              arrays=arrays, row_info=rows)
         start += math.ceil(len(ready) / TYPE_JUDGE_TILES_PER_SHEET) * TYPE_JUDGE_TILES_PER_SHEET
         pending -= set(ready)
         for key, j in judged.items():
@@ -628,16 +699,25 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
                 decisions[key] = {"type": "UNRECOGNISED", "basis": "llm_shape", "stage": "llm", "reason": f"judge_{j['status']}", "votes": j.get("votes", []),
                                   "tile": [j["sheet"], j["tile_id"]], **extra}
                 stage_counts[f"llm_{j['status']}"] += 1
+        decide_cells()
     for key in sorted(pending):  # cannot happen in a block hierarchy; kept visible if it ever does
         decisions[key] = {"type": "UNRECOGNISED", "basis": "geometry", "stage": "rules", "reason": "not_reached_by_the_top_down_judgement"}
         stage_counts["not_reached"] += 1
+    decide_cells()
     for key, d in decisions.items():
+        if d.get("basis") in ("row_structure", "row_kind"):
+            continue  # cells follow their row, follower rows their leader: re-derived below
         size = families[key]["size_mm"] if key in families else tuple(float(v) for v in key.split(":", 1)[1].split("x"))
-        if d["type"] in EQUIPMENT_TYPES and not size_plausible(d["type"], size):
+        if d["type"] in EQUIPMENT_TYPES and not size_plausible(d["type"], size, row=key in rows):
             d["rejected_type"] = d["type"]
             d["type"] = "UNRECOGNISED"
             d["reason"] = "size_implausible_for_type"
             stage_counts["size_rejected"] += 1
+    for key in [k for k, d in decisions.items() if d.get("basis") in ("row_structure", "row_kind")]:
+        del decisions[key]
+    decide_cells()
+    stage_counts["cells_of_row"] = sum(1 for d in decisions.values() if d.get("basis") == "row_structure")
+    stage_counts["rows_of_same_kind"] = sum(1 for d in decisions.values() if d.get("basis") == "row_kind")
 
     # --- block occurrences: which are counted
     equipment_families = {k for k, d in decisions.items() if k in families and d["type"] in EQUIPMENT_TYPES}
@@ -654,20 +734,31 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
             parent = p["parent_ref"]
         return found
 
+    def in_row(key: str, occ: dict[str, Any]) -> bool:
+        """This occurrence is a cell drawn inside one of its rows (counted through the row, never on its own)."""
+
+        parent = by_ref.get(occ["parent_ref"]) if occ["parent_ref"] else None
+        return parent is not None and parent["original_block"] in rows and rows[parent["original_block"]]["cell_family"] == key
+
     countable: list[tuple[str, dict[str, Any]]] = []
     assemblies: dict[str, dict[str, Any]] = {}
     nested_skipped = 0
+    cells_in_rows = 0
     for key in sorted(equipment_families):
         for occ in families[key]["occurrences"]:
+            if in_row(key, occ):
+                cells_in_rows += 1
+                continue
             above = machine_ancestors(occ)
             if not above:
                 countable.append((key, occ))
-            elif occ["ref"] in array_of and all(decisions[p["original_block"]]["basis"] == "llm_shape" for p in above):
-                # a packed regular array of modules: the modules are counted, the outer block is their assembly
+            elif (key in rows or occ["ref"] in array_of) and all(decisions[p["original_block"]]["basis"] == "llm_shape" for p in above):
+                # rows, or a packed regular array of modules: they are counted, the outer block is their assembly
                 countable.append((key, occ))
                 for p in above:
                     assemblies.setdefault(p["ref"], {"ref": p["ref"], "family": p["original_block"], "llm_type": decisions[p["original_block"]]["type"],
-                                                     "reason": "holds_a_packed_regular_array_of_counted_modules", "module_family": key})
+                                                     "reason": "holds_counted_rows" if key in rows else "holds_a_packed_regular_array_of_counted_modules",
+                                                     "module_family": key})
             else:
                 nested_skipped += 1
     from shapely.geometry import Point, Polygon
@@ -697,11 +788,16 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
         seen_positions.add(position)
         L, W = _footprint_size(occ["footprint"], scale)
         m = occ["matrix"]
+        basis = d.get("via", d["basis"]) if d["basis"] in ("row_structure", "row_kind") else d["basis"]  # a loose cell / follower row rests on what decided its row / kind
         record = {"ref": occ["ref"], "view_id": occ["view_id"], "type": d["type"], "type_zh": LABEL_ZH.get(d["type"], d["type"]),
-                  "name": d.get("name", ""), "family": key, "basis": d["basis"], "drawn_as": "block",
-                  "status": "accepted" if d["basis"] != "llm_shape" else "pending_independent_count_and_spot_check",
+                  "name": d.get("name", ""), "family": key, "basis": basis,
+                  "drawn_as": "row" if key in rows else "loose_cell" if key in cell_rows else "block",
+                  "status": "accepted" if basis != "llm_shape" else "pending_independent_count_and_spot_check",
                   "centre": [round(v, 1) for v in _centre(occ["bbox"])], "length_mm": round(L, 1), "width_mm": round(W, 1),
                   "rotation_deg": round(math.degrees(math.atan2(m[1], m[0])) % 360.0, 2)}
+        if key in rows:  # one row is one record; its cells are the second level of the count
+            record.update({"cells": rows[key]["cells_per_row"], "cell_family": rows[key]["cell_family"], "cell_size_mm": rows[key]["cell_size_mm"],
+                           "row_kind": follower_of.get(key, key)})
         if occ["ref"] in array_of:
             record["array"] = array_of[occ["ref"]]
         records.append(record)
@@ -729,7 +825,7 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
     # --- block occurrences that are candidates but got no type
     for key in sorted(unrecognised_families):
         for occ in families[key]["occurrences"]:
-            if not machine_ancestors(occ):
+            if not machine_ancestors(occ) and not in_row(key, occ):
                 untyped.append({"ref": occ["ref"], "view_id": occ["view_id"], "key": key, "bbox": occ["bbox"], "drawn_as": "block",
                                 "reason": decisions[key].get("reason")})
 
@@ -775,9 +871,24 @@ def recognise(inventory: dict[str, Any], views: list[dict[str, Any]], unit: dict
         summary[r["view_id"]][r["type"]]["llm_shape" if r["basis"] == "llm_shape" else "text_or_geometry"] += 1
     unrecognised = [{"family": k, "occurrences": len(families[k]["occurrences"]), "size_mm": [round(v) for v in families[k]["size_mm"]], **{x: decisions[k].get(x) for x in ("reason", "votes", "rejected_type", "wrong_if")}}
                     for k in sorted(unrecognised_families)]
+    row_summary = []
+    for row_key, info in sorted(rows.items()):
+        if row_key in follower_of:
+            continue  # listed under the leader of its kind
+        d = decisions.get(row_key) or {}
+        kind_keys = [row_key] + sorted(k for k, lead in follower_of.items() if lead == row_key)
+        counted = [r for r in records if r["family"] in kind_keys]
+        entry = {**info, "type": d.get("type"), "type_zh": LABEL_ZH.get(d.get("type"), d.get("type")), "basis": d.get("basis"),
+                 "rows_counted": len(counted), "cells_total": sum(r.get("cells") or 0 for r in counted), "wrong_if": d.get("wrong_if", "")}
+        if len(kind_keys) > 1:  # one kind of row drawn by several blocks: one entry, each block's share shown
+            entry["drawn_by"] = {k: sum(1 for r in counted if r["family"] == k) for k in kind_keys}
+            entry["also_drawn_by"] = [{**f, "rows_counted": entry["drawn_by"][f["family"]],
+                                       "cells_total": sum(r.get("cells") or 0 for r in counted if r["family"] == f["family"])} for f in info.get("also_drawn_by", [])]
+        row_summary.append(entry)
     return {
         "status": "done",
         "stage_counts": dict(stage_counts), "nested_occurrences_not_recounted": nested_skipped, "labels_not_used_for_type": weak_labels,
+        "rows": row_summary, "cell_occurrences_counted_through_rows": cells_in_rows,
         "exact_duplicates_not_recounted": duplicates_skipped, "parts_inside_named_outlines_not_recounted": parts_of_outline_machines,
         "families": {k: {"size_mm": [round(v) for v in f["size_mm"]], "occurrences": len(f["occurrences"]), "decision": decisions.get(k)} for k, f in families.items()},
         "records": records,
@@ -832,8 +943,14 @@ def equipment_markdown(result: dict[str, Any], views: list[dict[str, Any]]) -> s
     for copy in result.get("duplicate_views") or []:
         lines.append(f"\n{copy['view_id']}（{copy['title']}）与 {copy['same_as']} 的设备几乎相同（重合 {copy['overlap']:.0%}），是同一套图画了两遍：两处的数量不能相加。")
     drawn = Counter(r.get("drawn_as", "block") for r in result["records"])
-    lines += ["", f"画法：一个图块一台 {drawn.get('block', 0)}；闭合轮廓里写着设备名 {drawn.get('labelled_outline', 0)}；用闭合矩形画的格位 {drawn.get('outline_cell', 0)}。",
+    lines += ["", f"画法：一个图块一台 {drawn.get('block', 0)}；成排画的图块（整排计 1）{drawn.get('row', 0)}；排外零散的格位 {drawn.get('loose_cell', 0)}；"
+              f"闭合轮廓里写着设备名 {drawn.get('labelled_outline', 0)}；用闭合矩形画的格位 {drawn.get('outline_cell', 0)}。",
               f"成排等间距的相同图块：{len(result.get('regular_arrays', []))} 组；外层图块因里面是成排模块而不计：{len(result.get('assemblies_not_counted', []))} 处。"]
+    for row in result.get("rows") or []:
+        if row.get("rows_counted"):
+            shares = "".join(f"，其中图块 {f['family'][:30]} 画的 {f['rows_counted']} 排" for f in row.get("also_drawn_by") or [] if f.get("rows_counted"))
+            lines.append(f"成排画的{row['type_zh']}：{row['row_family'][:30]} {row['rows_counted']} 排{shares}，每排 {row['cells_per_row']} 格"
+                         f"（{row['cell_size_mm'][0]}×{row['cell_size_mm'][1]} mm，节距 {float(row['pitch_mm']):.0f} mm），共 {row['cells_total']} 格；上表按排计。")
     if result.get("stated_quantities"):
         lines += ["", "图上写的数量与程序计数对照：", "", "| 视图 | 图上文字 | 图上写 | 程序数到 | 结论 |", "|---|---|---|---|---|"]
         for q in result["stated_quantities"]:
