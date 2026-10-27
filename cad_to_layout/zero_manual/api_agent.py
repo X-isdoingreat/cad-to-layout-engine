@@ -25,7 +25,13 @@ MODEL_ALIASES = {"sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5", "haik
 DEFAULT_MODEL = "claude-sonnet-5-5"  # the reads were tuned on Sonnet (2026-10-17: keep sonnet)
 EFFORT = os.environ.get("CTLE_API_EFFORT", "xhigh")  # Claude Code's default effort, so the API read thinks as the CLI read does
 MAX_TOKENS = 64000  # streamed, so no HTTP timeout; one turn is a few tool calls or the final JSON
-MAX_RETRIES = 4  # the SDK retries 429 / 5xx / connection errors with backoff
+MAX_RETRIES = 4  # the SDK retries 429 / 5xx / connection errors with backoff (seconds apart)
+# 2026-10-26: an outage longer than the SDK's backoff killed one reader of a drawing.  After a transient error the failed
+# request alone is repeated once more after a longer pause, with the conversation so far kept (CEO: only the one that failed).
+TRANSIENT_RETRIES = 1
+TRANSIENT_RETRY_WAIT_SECONDS = 60.0
+TRANSIENT_ERROR_NAMES = {"APIConnectionError", "APITimeoutError", "RateLimitError", "InternalServerError", "OverloadedError"}
+_sleep = time.sleep  # replaced in tests
 TOOL_TIMEOUT_SECONDS = 600.0
 TOOL_OUTPUT_MAX_CHARS = 30000  # what Claude Code keeps of one command's output; the tools page their lists anyway
 IMAGE_MAX_EDGE_PX = 2576  # the high-resolution image limit of current Sonnet / Opus
@@ -79,6 +85,32 @@ def _create(api: Any, model: str, messages: list[Any], system: str | None = None
             return stream.get_final_message()
     with api.messages.stream(**params) as stream:
         return stream.get_final_message()
+
+
+def _transient(exc: Exception) -> bool:
+    """A failure worth one more try after a pause: connection loss, rate limit, the API's own errors (5xx, api_error, overloaded)."""
+
+    if type(exc).__name__ in TRANSIENT_ERROR_NAMES:
+        return True
+    body = getattr(exc, "body", None)
+    kind = ((body or {}).get("error") or {}).get("type") if isinstance(body, dict) else None
+    return kind in ("api_error", "overloaded_error") or int(getattr(exc, "status_code", 0) or 0) >= 500
+
+
+def _create_retrying(api: Any, model: str, messages: list[Any], events: list[Any], **params: Any) -> tuple[Any, int]:
+    """`_create`; after a transient error (the SDK's own short retries exhausted) the same request once more after
+    TRANSIENT_RETRY_WAIT_SECONDS.  Only the failed request is repeated, the conversation stays.  Returns (response, waits)."""
+
+    waited = 0
+    while True:
+        try:
+            return _create(api, model, messages, **params), waited
+        except Exception as exc:
+            if waited >= TRANSIENT_RETRIES or not _transient(exc):
+                raise
+            waited += 1
+            events.append({"transient_error": f"{type(exc).__name__}: {exc}", "retry_after_seconds": TRANSIENT_RETRY_WAIT_SECONDS, "attempt": waited})
+            _sleep(TRANSIENT_RETRY_WAIT_SECONDS)
 
 
 def _add_usage(total: dict[str, int], usage: Any) -> int:
@@ -166,7 +198,7 @@ def run_api(work: Path, prompt: str, started: float, timeout_seconds: float, tag
     usage: dict[str, int] = {k: 0 for k in USAGE_KEYS}
     messages: list[Any] = [{"role": "user", "content": prompt}]
     events, tool_calls, error, returncode, peak, turns, answers = [], 0, None, 0, 0, 0, []
-    response = None
+    response, retries = None, 0
     try:
         api = api or client()
     except Exception as exc:  # e.g. the SDK is not installed
@@ -176,8 +208,9 @@ def run_api(work: Path, prompt: str, started: float, timeout_seconds: float, tag
             error, returncode = f"[timeout after {timeout_seconds:.0f} s]", -1
             break
         try:
-            response = _create(api, model, messages, system=UNATTENDED_NOTE + API_NOTE, tools=TOOLS)
-        except Exception as exc:  # API errors after the SDK's retries, auth, network: a failed call, not a crash
+            response, waited = _create_retrying(api, model, messages, events, system=UNATTENDED_NOTE + API_NOTE, tools=TOOLS)
+            retries += waited
+        except Exception as exc:  # API errors after the SDK's retries and ours, auth, network: a failed call, not a crash
             error, returncode = f"{type(exc).__name__}: {exc}", -1
             break
         turns += 1
@@ -213,7 +246,8 @@ def run_api(work: Path, prompt: str, started: float, timeout_seconds: float, tag
     (work / f"answer{tag}.txt").write_text(text, encoding="utf-8")
     cost = cost_usd(model, usage)
     summary = {"backend": "api", "provider": "anthropic-api", "model": model, "effort": EFFORT, "turns": turns, "tool_calls": tool_calls,
-               "usage": usage, "peak_context_tokens": peak, "cost_usd": cost, "minutes": round((time.time() - started) / 60, 1), "error": error}
+               "usage": usage, "peak_context_tokens": peak, "cost_usd": cost, "minutes": round((time.time() - started) / 60, 1), "error": error,
+               "transient_retries": retries}
     (work / f"usage{tag}.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
     answer = _json_from(text)
     earlier = None
@@ -236,13 +270,13 @@ def api_transport(model: str | None = None, timeout_seconds: float = 600.0, api:
         work_dir.mkdir(parents=True, exist_ok=True)
         name = api_model(model)
         usage: dict[str, int] = {k: 0 for k in USAGE_KEYS}
-        text, error, returncode = "", None, 0
+        text, error, returncode, retries, log = "", None, 0, 0, []
         started = time.time()
         try:
             content, _ = run_tool(image.resolve().parent, "view_image", {"path": image.name})
             if not isinstance(content, list):
                 raise FileNotFoundError(content)
-            response = _create(api or client(), name, [{"role": "user", "content": content + [{"type": "text", "text": prompt}]}])
+            response, retries = _create_retrying(api or client(), name, [{"role": "user", "content": content + [{"type": "text", "text": prompt}]}], log)
             _add_usage(usage, response.usage)
             (work_dir / "events.jsonl").write_text(json.dumps(response.to_dict(), ensure_ascii=False, default=str), encoding="utf-8")
             text = _text(response)
@@ -254,7 +288,7 @@ def api_transport(model: str | None = None, timeout_seconds: float = 600.0, api:
         (work_dir / "stderr.txt").write_text((error or "") + "\n", encoding="utf-8")
         cost = cost_usd(name, usage)
         (work_dir / "usage.json").write_text(json.dumps({"backend": "api", "provider": "anthropic-api", "model": name, "effort": EFFORT, "turns": 1,
-                                                         "tool_calls": 0, "usage": usage, "cost_usd": cost, "error": error,
+                                                         "tool_calls": 0, "usage": usage, "cost_usd": cost, "error": error, "transient_retries": retries,
                                                          "minutes": round((time.time() - started) / 60, 2)}, ensure_ascii=False, indent=1), encoding="utf-8")
         return {"text": text, "returncode": returncode, "provider": "anthropic-api", "model": name,
                 "tokens_used": sum(usage.values()) or None, "error": error}

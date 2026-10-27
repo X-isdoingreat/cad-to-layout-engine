@@ -444,6 +444,21 @@ def repeat_pages(pdf: Any, pyplot: Any, run: Path, summary: dict[str, Any]) -> N
     index.con.close()
 
 
+METHOD_ZH = {"a": "甲（沿外墙描）", "b": "乙（按结构推）"}
+
+
+def _area_status(area: dict[str, Any]) -> str:
+    """The summary's status sentence tells how many methods read the building (2026-10-26: one reader had failed on a
+    transient API error and the sentence still said two)."""
+
+    methods = area.get("methods") if isinstance(area.get("methods"), dict) else None
+    missing = [k for k in ("a", "b") if methods is not None and not methods.get(k)]
+    if methods is None or not missing:
+        return "厂房面积由两种独立方法读出并经复查 AI 核对（状态见上）；设备为系统识别结果。人工复查为可选步骤。"
+    return (f"厂房面积只有一种方法读出（{area.get('source_zh') or ''}），另一种方法{'、'.join(METHOD_ZH[k] for k in missing)}没有结果，没能两种方法互核，建议沿红线看一眼；"
+            "设备为系统识别结果。")
+
+
 def conclusion(pyplot: Any, drawing: str, area: dict[str, Any] | None, equipment: dict[str, Any]) -> Any:
     figure = pyplot.figure(figsize=PAGE)
     figure.text(0.06, 0.88, "图纸识别报告", fontsize=28, weight="bold")
@@ -473,8 +488,7 @@ def conclusion(pyplot: Any, drawing: str, area: dict[str, Any] | None, equipment
     for r in equipment.get("repeat") or []:
         rows.append(("重复图形", f"{r['floor'][:14]}：{r['guess']} {r['count']:,} 处（{r['id']}，系统按重复图形统计，每处算几{r['unit'] if r['unit'] != '处' else '台'}待您确认）"
                      + (f"；另有 {len(r['questions'])} 组拿不准（{'、'.join(r['questions'])}），未计入" if r["questions"] else "")))
-    rows.append(("状态", "厂房面积由两种独立方法读出并经复查 AI 核对（状态见上）；设备为系统识别结果。人工复查为可选步骤。" if area and area.get("status_code")
-                 else "以上为系统识别结果，尚未经人工核对。"))
+    rows.append(("状态", _area_status(area) if area and area.get("status_code") else "以上为系统识别结果，尚未经人工核对。"))
     if equipment.get("questions"):
         q = [x for x in equipment["questions"] if x.startswith("E")]
         rq = [x for x in equipment["questions"] if x.startswith("R")]

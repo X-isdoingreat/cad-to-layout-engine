@@ -127,6 +127,38 @@ class ApiBackendTests(unittest.TestCase):
             self.assertIn(expected, (self.work / f"stderr_{i}.txt").read_text(encoding="utf-8"))
             self.assertIn(expected, json.loads((self.work / f"usage_{i}.json").read_text(encoding="utf-8"))["error"])
 
+    def test_a_transient_api_error_is_retried_once_in_place(self):
+        class APIStatusError(Exception):  # the shape of the SDK's error: a body with the API's error type, a status code
+            def __init__(self, kind, status=500):
+                super().__init__(f"{kind}: Unable to complete this request right now. Please try again.")
+                self.body, self.status_code = {"type": "error", "error": {"type": kind}}, status
+
+        waits = []
+        answer = response([block("text", text=ANSWER)])
+        with mock.patch.object(api_agent, "_sleep", waits.append), mock.patch.object(api_agent, "run_tool", lambda *a: ("{}", False)):
+            once = FakeAPI([response([block("tool_use", id="t", name="agent_tools", input={"args": ["overview"]})], "tool_use"),
+                            APIStatusError("api_error"), answer])
+            got = self.run_api(once, tag="_once")
+            self.assertEqual((got["returncode"], got["answer"]["buildings"][0]["name"], waits), (0, "A", [api_agent.TRANSIENT_RETRY_WAIT_SECONDS]))
+            self.assertEqual(len(once.requests[1]["messages"]), len(once.requests[2]["messages"]), "the same request again: the conversation so far is kept")
+            usage = json.loads((self.work / "usage_once.json").read_text(encoding="utf-8"))
+            self.assertEqual((usage["transient_retries"], usage["turns"]), (1, 2))
+            self.assertIn('"transient_error"', (self.work / "events_once.txt").read_text(encoding="utf-8"))
+            twice = self.run_api(FakeAPI([APIStatusError("overloaded_error", 529), APIStatusError("overloaded_error", 529), answer]), tag="_twice")
+            self.assertEqual((twice["returncode"], twice["answer"], len(waits)), (-1, None, 2), "one more try, then a failed call")
+            self.assertIn("overloaded_error", (self.work / "stderr_twice.txt").read_text(encoding="utf-8"))
+            bad = self.run_api(FakeAPI([APIStatusError("invalid_request_error", 400), answer]), tag="_bad")
+            self.assertEqual((bad["returncode"], len(waits)), (-1, 2), "a 400 is not retried")
+        with mock.patch.object(api_agent, "_sleep", waits.append):  # the judge opens the picture with the real view_image
+            from PIL import Image
+
+            image = self.work / "tile.png"
+            Image.new("RGB", (64, 64), "white").save(image)
+            judge = api_agent.api_transport(api=FakeAPI([APIStatusError("api_error"), response([block("text", text="RACK")])]))
+            raw = judge("PROMPT", image, self.work / "judge-1")
+            self.assertEqual((raw["error"], raw["text"], len(waits)), (None, "RACK", 3), "the judge's one-picture call is repeated the same way")
+            self.assertEqual(json.loads((self.work / "judge-1" / "usage.json").read_text(encoding="utf-8"))["transient_retries"], 1)
+
     def test_the_answer_given_before_a_closing_remark_is_kept(self):
         api = FakeAPI([response([block("text", text=ANSWER), block("tool_use", id="t", name="agent_tools", input={"args": ["overview"]})], "tool_use"),
                        response([block("text", text="完成。")])])
